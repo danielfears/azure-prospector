@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a generic Azure optimization capability
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Which optimization or workflow problem should Prospector solve?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Azure evidence
+      description: Which documented API, metric, relationship, or billing field supports the finding?
+    validations:
+      required: true
+  - type: textarea
+    id: false-positives
+    attributes:
+      label: False-positive considerations
+      description: When would this recommendation be misleading or unsafe?
+    validations:
+      required: true

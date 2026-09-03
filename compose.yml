@@ -1,0 +1,19 @@
+services:
+  prospector:
+    build: .
+    ports:
+      - "127.0.0.1:4310:4310"
+    environment:
+      PORT: 4310
+      HOST: 0.0.0.0
+      PROSPECTOR_DB_PATH: /data/azure-prospector.db
+      PROSPECTOR_AUTH_MODE: ${PROSPECTOR_AUTH_MODE:-default}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      PROSPECTOR_SUBSCRIPTION_IDS: ${PROSPECTOR_SUBSCRIPTION_IDS:-}
+      PROSPECTOR_OWNER_TAGS: ${PROSPECTOR_OWNER_TAGS:-owner,serviceOwner,applicationOwner,technicalOwner}
+    volumes:
+      - prospector-data:/data
+
+volumes:
+  prospector-data:
