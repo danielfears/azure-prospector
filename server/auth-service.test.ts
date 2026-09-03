@@ -172,7 +172,9 @@ describe('AzureAuthenticationService', () => {
       browserCredential: new StubBrokerCredential(true),
     })
 
-    expect(() => service.credentialForTenant('tenant-two')).toThrow(
+    expect(() =>
+      service.credentialForSubscription('sub-two', 'tenant-two'),
+    ).toThrow(
       'outside the configured Azure tenant',
     )
   })
@@ -199,8 +201,8 @@ describe('AzureAuthenticationService', () => {
           },
         ])
       }
-      const tenantIndex = arguments_.indexOf('--tenant')
-      if (arguments_[tenantIndex + 1] === 'tenant-one') return ''
+      const subscriptionIndex = arguments_.indexOf('--subscription')
+      if (arguments_[subscriptionIndex + 1] === 'sub-one') return ''
       throw new Error('Refresh token expired')
     })
     const service = new AzureAuthenticationService({

@@ -16,7 +16,10 @@ import type {
 
 interface SelectedAzureAuthentication {
   listSubscriptions(): Promise<AzureSubscriptionOption[]>
-  credentialForTenant(tenantId: string): TokenCredential
+  credentialForSubscription(
+    subscriptionId: string,
+    tenantId: string,
+  ): TokenCredential
 }
 
 function groupByTenant(
@@ -154,27 +157,26 @@ export class SelectedAzureProvider implements ProspectorProvider {
     const snapshots: ProviderSnapshot[] = []
     const tenantWarnings: string[] = []
     const tenantGroups = groupByTenant(selected)
-    for (const [tenantId, subscriptions] of tenantGroups) {
+    for (const subscription of selected) {
       try {
-        const credential = this.authentication.credentialForTenant(tenantId)
+        const credential =
+          this.authentication.credentialForSubscription(
+            subscription.id,
+            subscription.tenantId,
+          )
         const snapshot = await new AzureProvider(
           credential,
-          tenantId,
+          subscription.tenantId,
         ).collect({
-          tenantId,
-          subscriptionIds: subscriptions.map(
-            (subscription) => subscription.id,
-          ),
+          tenantId: subscription.tenantId,
+          subscriptionIds: [subscription.id],
         })
         snapshots.push(snapshot)
       } catch (error) {
-        const tenantName = subscriptions[0]?.tenantName ?? 'selected tenant'
         const reason =
           error instanceof Error ? error.message : 'Unknown Azure error'
         tenantWarnings.push(
-          `${subscriptions.length} selected ${
-            subscriptions.length === 1 ? 'subscription' : 'subscriptions'
-          } in ${tenantName} could not be scanned: ${reason}`,
+          `${subscription.name} in ${subscription.tenantName} could not be scanned: ${reason}`,
         )
       }
     }

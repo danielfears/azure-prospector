@@ -48,7 +48,7 @@ describe('SelectedAzureProvider', () => {
       async listSubscriptions() {
         return [subscription('sub-one', 'tenant-one')]
       },
-      credentialForTenant() {
+      credentialForSubscription() {
         throw new Error('Credential should not be requested')
       },
     })
@@ -116,7 +116,7 @@ describe('SelectedAzureProvider', () => {
       async listSubscriptions() {
         return subscriptions
       },
-      credentialForTenant(tenantId) {
+      credentialForSubscription(_subscriptionId, tenantId) {
         return tenantId === 'tenant-one'
           ? validCredential
           : unavailableCredential
@@ -136,7 +136,7 @@ describe('SelectedAzureProvider', () => {
       status: 'partial',
     })
     expect(snapshot.warnings).toContain(
-      '1 selected subscription in Tenant tenant-two could not be scanned: Tenant sign-in is required',
+      'Subscription sub-two in Tenant tenant-two could not be scanned: Tenant sign-in is required',
     )
   })
 })

@@ -355,7 +355,10 @@ export class AzureAuthenticationService implements TokenCredential {
     return this.getStatus()
   }
 
-  credentialForTenant(tenantId: string): TokenCredential {
+  credentialForSubscription(
+    subscriptionId: string,
+    tenantId: string,
+  ): TokenCredential {
     if (
       this.tenantId &&
       tenantId.toLowerCase() !== this.tenantId.toLowerCase()
@@ -365,7 +368,9 @@ export class AzureAuthenticationService implements TokenCredential {
       )
     }
     if (this.activeSource === 'azure_cli') {
-      return new AzureCliCredential({ tenantId })
+      return new AzureCliCredential({
+        subscription: subscriptionId,
+      })
     }
     return this
   }
@@ -386,30 +391,27 @@ export class AzureAuthenticationService implements TokenCredential {
       )
   }
 
-  private async checkCliTenantSessions(
+  private async checkCliSubscriptionSessions(
     subscriptions: AzureSubscriptionOption[],
   ): Promise<AzureSubscriptionOption[]> {
-    const tenantIds = [
-      ...new Set(subscriptions.map((subscription) => subscription.tenantId)),
-    ]
     const statuses = new Map(
       await Promise.all(
-        tenantIds.map(async (tenantId) => {
+        subscriptions.map(async (subscription) => {
           try {
             await this.azureCliCommand([
               'account',
               'get-access-token',
-              '--tenant',
-              tenantId,
+              '--subscription',
+              subscription.id,
               '--resource',
               'https://management.azure.com',
               '--output',
               'none',
               '--only-show-errors',
             ])
-            return [tenantId, 'ready'] as const
+            return [subscription.id, 'ready'] as const
           } catch {
-            return [tenantId, 'refresh_required'] as const
+            return [subscription.id, 'refresh_required'] as const
           }
         }),
       ),
@@ -417,7 +419,7 @@ export class AzureAuthenticationService implements TokenCredential {
     return subscriptions.map((subscription) => ({
       ...subscription,
       authenticationStatus:
-        statuses.get(subscription.tenantId) ?? 'refresh_required',
+        statuses.get(subscription.id) ?? 'refresh_required',
     }))
   }
 
@@ -463,7 +465,7 @@ export class AzureAuthenticationService implements TokenCredential {
         : await this.armSubscriptions()
     const subscriptions =
       this.activeSource === 'azure_cli'
-        ? await this.checkCliTenantSessions(discoveredSubscriptions)
+        ? await this.checkCliSubscriptionSessions(discoveredSubscriptions)
         : discoveredSubscriptions
     return subscriptions
       .filter(

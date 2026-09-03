@@ -90,11 +90,12 @@ tenants available to the current Azure CLI account; Prospector scans each
 tenant scope with the appropriate credential and combines the results.
 
 Azure CLI can retain cached subscription names after a tenant refresh token has
-expired. Prospector therefore requests one management token per cached tenant
-when the picker opens. Stale tenants remain visible for diagnosis, but their
-subscriptions are disabled and accompanied by an exact tenant-specific
-`az login` command. After refreshing the CLI session, choose **Recheck
-sessions** without leaving the picker.
+expired. Prospector therefore validates each cached subscription using the
+account Azure CLI binds to that subscription, rather than assuming the current
+default account. Stale sessions remain visible for diagnosis, but affected
+subscriptions are disabled and accompanied by an `az login` command. After
+refreshing the relevant account, choose **Recheck sessions** without leaving
+the picker.
 
 Each successful live scan is saved as a named workspace. Home lists the
 collection so assessments can be reopened, rescanned with their saved scope, or

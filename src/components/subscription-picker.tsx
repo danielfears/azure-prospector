@@ -204,87 +204,102 @@ export function SubscriptionPicker({
             <div className="space-y-5">
               {[...byTenant.entries()].map(
                 ([tenantId, { tenantName, subscriptions: items }]) => {
-                  const refreshRequired = items.every(
+                  const staleItems = items.filter(
                     (subscription) =>
                       subscription.authenticationStatus ===
                       'refresh_required',
                   )
+                  const refreshRequired =
+                    staleItems.length === items.length
                   return (
-                <section key={tenantId}>
-                  <div className="mb-2 flex items-center justify-between gap-3 px-2">
-                    <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
-                      {tenantName}
-                    </div>
-                    <span
-                      className={cn(
-                        'text-[11px] font-semibold',
-                        refreshRequired
-                          ? 'text-destructive'
-                          : 'text-success',
-                      )}
-                    >
-                      {refreshRequired ? 'Refresh required' : 'Session ready'}
-                    </span>
-                  </div>
-                  {refreshRequired && (
-                    <div className="mb-2 rounded-[0.625rem] border border-destructive bg-secondary p-3">
-                      <div className="flex items-start gap-2">
-                        <AlertTriangle
-                          className="mt-0.5 size-4 shrink-0 text-destructive"
-                          aria-hidden="true"
-                        />
-                        <div className="min-w-0">
-                          <div className="text-xs font-bold text-foreground">
-                            Azure CLI sign-in has expired for this tenant
-                          </div>
-                          <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                            Refresh it in a terminal, then recheck sessions.
-                          </p>
-                          <code className="mt-2 block overflow-x-auto rounded-md border bg-card px-2 py-1 text-xs text-foreground">
-                            az login --tenant {tenantId} --use-device-code
-                            {' '}--allow-no-subscriptions
-                          </code>
+                    <section key={tenantId}>
+                      <div className="mb-2 flex items-center justify-between gap-3 px-2">
+                        <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
+                          {tenantName}
                         </div>
+                        <span
+                          className={cn(
+                            'text-[11px] font-semibold',
+                            staleItems.length
+                              ? 'text-destructive'
+                              : 'text-success',
+                          )}
+                        >
+                          {refreshRequired
+                            ? 'Refresh required'
+                            : staleItems.length
+                              ? `${staleItems.length} stale`
+                              : 'Session ready'}
+                        </span>
                       </div>
-                    </div>
-                  )}
-                  <div className="space-y-2">
-                    {items.map((subscription) => (
-                      <label
-                        key={subscription.id}
-                        className={cn(
-                          'flex items-center gap-3 rounded-[0.625rem] border bg-card p-3 transition-colors',
-                          refreshRequired
-                            ? 'cursor-not-allowed opacity-55'
-                            : 'cursor-pointer hover:bg-secondary',
-                        )}
-                      >
-                        <input
-                          type="checkbox"
-                          className="size-4 shrink-0 accent-[var(--cp-accent)]"
-                          checked={selectedIds.includes(subscription.id)}
-                          disabled={refreshRequired}
-                          onChange={() => toggle(subscription.id)}
-                        />
-                        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-secondary text-primary">
-                          <Cloud className="size-4" aria-hidden="true" />
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-sm font-semibold text-foreground">
-                            {subscription.name}
-                          </span>
-                          <span className="mt-0.5 block text-xs text-muted-foreground">
-                            {subscription.isDefault
-                              ? 'Current CLI subscription'
-                              : refreshRequired
-                                ? 'Refresh tenant sign-in to select'
-                                : 'Enabled subscription'}
-                          </span>
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </section>
+                      {staleItems.length > 0 && (
+                        <div className="mb-2 rounded-[0.625rem] border border-destructive bg-secondary p-3">
+                          <div className="flex items-start gap-2">
+                            <AlertTriangle
+                              className="mt-0.5 size-4 shrink-0 text-destructive"
+                              aria-hidden="true"
+                            />
+                            <div className="min-w-0">
+                              <div className="text-xs font-bold text-foreground">
+                                Azure CLI sign-in has expired for this tenant
+                              </div>
+                              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                                Refresh the relevant account in a terminal, then
+                                recheck sessions.
+                              </p>
+                              <code className="mt-2 block overflow-x-auto rounded-md border bg-card px-2 py-1 text-xs text-foreground">
+                                az login --use-device-code
+                                {' '}--allow-no-subscriptions
+                              </code>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      <div className="space-y-2">
+                        {items.map((subscription) => {
+                        const subscriptionNeedsRefresh =
+                          subscription.authenticationStatus ===
+                          'refresh_required'
+                          return (
+                            <label
+                              key={subscription.id}
+                              className={cn(
+                                'flex items-center gap-3 rounded-[0.625rem] border bg-card p-3 transition-colors',
+                                subscriptionNeedsRefresh
+                                  ? 'cursor-not-allowed opacity-55'
+                                  : 'cursor-pointer hover:bg-secondary',
+                              )}
+                            >
+                              <input
+                                type="checkbox"
+                                className="size-4 shrink-0 accent-[var(--cp-accent)]"
+                                checked={selectedIds.includes(subscription.id)}
+                                disabled={subscriptionNeedsRefresh}
+                                onChange={() => toggle(subscription.id)}
+                              />
+                              <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-secondary text-primary">
+                                <Cloud
+                                  className="size-4"
+                                  aria-hidden="true"
+                                />
+                              </span>
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-sm font-semibold text-foreground">
+                                  {subscription.name}
+                                </span>
+                                <span className="mt-0.5 block text-xs text-muted-foreground">
+                                  {subscription.isDefault
+                                    ? 'Current CLI subscription'
+                                    : subscriptionNeedsRefresh
+                                      ? 'Refresh account sign-in to select'
+                                      : 'Enabled subscription'}
+                                </span>
+                              </span>
+                            </label>
+                          )
+                        })}
+                      </div>
+                    </section>
                   )
                 },
               )}
