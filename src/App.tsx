@@ -12,6 +12,7 @@ import {
   Gem,
   LayoutDashboard,
   ListChecks,
+  LogIn,
   LoaderCircle,
   Moon,
   Pickaxe,
@@ -32,7 +33,9 @@ import { CostTrendChart } from '@/components/cost-trend-chart'
 import { CoveragePanel } from '@/components/coverage-panel'
 import { RecommendationDetail } from '@/components/recommendation-detail'
 import { RecommendationTable } from '@/components/recommendation-table'
+import { ScanProgress } from '@/components/scan-progress'
 import { StatCard } from '@/components/stat-card'
+import { SubscriptionPicker } from '@/components/subscription-picker'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -41,8 +44,11 @@ import {
   createException,
   clearException,
   getActions,
+  getAuthStatus,
+  getAzureSubscriptions,
   getOverview,
   getRecommendations,
+  signInWithBrowser,
   startScan,
   updateActionStatus,
 } from '@/lib/api'
@@ -50,6 +56,7 @@ import {
   formatCategory,
   formatActionStatus,
   formatCurrency,
+  formatCurrencyAmounts,
   formatDate,
   formatStatus,
 } from '@/lib/format'
@@ -58,8 +65,11 @@ import {
   recommendationCategories,
   recommendationStatuses,
   type ActionStatus,
+  type AuthStatusResponse,
+  type AzureSubscriptionOption,
   type CreateActionRequest,
   type CreateExceptionRequest,
+  type MonetaryAmount,
   type OverviewResponse,
   type Recommendation,
   type RecommendationCategory,
@@ -91,15 +101,82 @@ function loadDashboardData() {
   ])
 }
 
+function amountsByCurrency(
+  recommendations: Recommendation[],
+): MonetaryAmount[] {
+  return [
+    ...recommendations
+      .reduce((totals, recommendation) => {
+        totals.set(
+          recommendation.currency,
+          (totals.get(recommendation.currency) ?? 0) +
+            recommendation.estimatedMonthlySavings,
+        )
+        return totals
+      }, new Map<string, number>())
+      .entries(),
+  ].map(([currency, amount]) => ({ currency, amount }))
+}
+
+function recommendationsByNativeValue(
+  recommendations: Recommendation[],
+  limit: number,
+): Recommendation[] {
+  const byCurrency = new Map<string, Recommendation[]>()
+  for (const recommendation of recommendations) {
+    const group = byCurrency.get(recommendation.currency) ?? []
+    group.push(recommendation)
+    byCurrency.set(recommendation.currency, group)
+  }
+  const groups = [...byCurrency.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, items]) =>
+      items.sort(
+        (left, right) =>
+          right.estimatedMonthlySavings * right.confidence -
+          left.estimatedMonthlySavings * left.confidence,
+      ),
+    )
+  const ranked: Recommendation[] = []
+  for (let index = 0; ranked.length < limit; index += 1) {
+    let added = false
+    for (const group of groups) {
+      const recommendation = group[index]
+      if (!recommendation) continue
+      ranked.push(recommendation)
+      added = true
+      if (ranked.length === limit) break
+    }
+    if (!added) break
+  }
+  return ranked
+}
+
 function App() {
   const [overview, setOverview] = useState<OverviewResponse>()
   const [recommendations, setRecommendations] = useState<Recommendation[]>([])
   const [actions, setActions] = useState<RemediationAction[]>([])
   const [selected, setSelected] = useState<Recommendation>()
   const [activeView, setActiveView] = useState<View>('overview')
-  const [scanMode, setScanMode] = useState<ScanMode>()
+  const [authentication, setAuthentication] = useState<AuthStatusResponse>()
   const [loading, setLoading] = useState(true)
-  const [scanning, setScanning] = useState(false)
+  const [scanning, setScanning] = useState<ScanMode>()
+  const [connecting, setConnecting] = useState(false)
+  const [loadingSubscriptions, setLoadingSubscriptions] = useState(false)
+  const [subscriptionPickerOpen, setSubscriptionPickerOpen] =
+    useState(false)
+  const [subscriptionOptions, setSubscriptionOptions] = useState<
+    AzureSubscriptionOption[]
+  >([])
+  const [selectedSubscriptionIds, setSelectedSubscriptionIds] = useState<
+    string[]
+  >([])
+  const [subscriptionSearch, setSubscriptionSearch] = useState('')
+  const [assessmentName, setAssessmentName] = useState('')
+  const [activeAssessment, setActiveAssessment] = useState<{
+    name: string
+    subscriptionCount: number
+  }>()
   const [mutating, setMutating] = useState(false)
   const [notice, setNotice] = useState<string>()
   const [error, setError] = useState<string>()
@@ -115,22 +192,16 @@ function App() {
   const [includeExcepted, setIncludeExcepted] = useState(false)
 
   async function refresh(selectedId?: string) {
-    try {
-      const [nextOverview, nextRecommendations, nextActions] =
-        await loadDashboardData()
-      setOverview(nextOverview)
-      setRecommendations(nextRecommendations)
-      setActions(nextActions)
-      setScanMode((current) => current ?? nextOverview.estate.mode)
-      if (selectedId) {
-        setSelected(nextRecommendations.find((item) => item.id === selectedId))
-      }
-      setError(undefined)
-    } catch (requestError) {
-      setError(messageFromError(requestError))
-    } finally {
-      setLoading(false)
+    const [nextOverview, nextRecommendations, nextActions] =
+      await loadDashboardData()
+    setOverview(nextOverview)
+    setRecommendations(nextRecommendations)
+    setActions(nextActions)
+    if (selectedId) {
+      setSelected(nextRecommendations.find((item) => item.id === selectedId))
     }
+    setError(undefined)
+    void getAuthStatus().then(setAuthentication).catch(() => undefined)
   }
 
   useEffect(() => {
@@ -141,13 +212,25 @@ function App() {
         setOverview(nextOverview)
         setRecommendations(nextRecommendations)
         setActions(nextActions)
-        setScanMode(nextOverview.estate.mode)
       })
       .catch((requestError: unknown) => {
         if (active) setError(messageFromError(requestError))
       })
       .finally(() => {
         if (active) setLoading(false)
+      })
+    void getAuthStatus()
+      .then((nextAuthentication) => {
+        if (active) setAuthentication(nextAuthentication)
+      })
+      .catch((requestError: unknown) => {
+        if (!active) return
+        setAuthentication({
+          authenticated: false,
+          source: 'none',
+          browserLoginAvailable: true,
+          message: messageFromError(requestError),
+        })
       })
     return () => {
       active = false
@@ -198,37 +281,137 @@ function App() {
 
   const topRecommendations = useMemo(
     () =>
-      recommendations
-        .filter(
+      recommendationsByNativeValue(
+        recommendations.filter(
           (recommendation) =>
-            ['open', 'accepted', 'in_progress'].includes(recommendation.status) &&
-            !recommendation.exception,
-        )
-        .sort((left, right) => {
-          const leftScore = left.estimatedMonthlySavings * left.confidence
-          const rightScore = right.estimatedMonthlySavings * right.confidence
-          return rightScore - leftScore
-        })
-        .slice(0, 6),
+            ['open', 'accepted', 'in_progress'].includes(
+              recommendation.status,
+            ) && !recommendation.exception,
+        ),
+        6,
+      ),
     [recommendations],
   )
 
-  async function runScan() {
-    const selectedMode = scanMode ?? overview?.estate.mode ?? 'demo'
-    setScanning(true)
+  async function connectAzure(showConnectedNotice = true): Promise<boolean> {
+    setConnecting(true)
     setNotice(undefined)
     setError(undefined)
     try {
-      const scan = await startScan({ mode: selectedMode })
-      setScanMode(scan.mode)
+      const status = await getAuthStatus()
+      setAuthentication(status)
+      if (status.authenticated) {
+        if (showConnectedNotice) setNotice(status.message)
+        return true
+      }
+      if (status.browserLoginAvailable) {
+        const browserStatus = await signInWithBrowser()
+        setAuthentication(browserStatus)
+        if (browserStatus.authenticated) {
+          if (showConnectedNotice) setNotice(browserStatus.message)
+          return true
+        }
+        setError(browserStatus.message)
+        return false
+      }
+      setError(status.message)
+      return false
+    } catch (connectionError) {
+      setError(messageFromError(connectionError))
+      return false
+    } finally {
+      setConnecting(false)
+    }
+  }
+
+  async function openAssessment() {
+    setNotice(undefined)
+    setError(undefined)
+    if (!(await connectAzure(false))) return
+    setLoadingSubscriptions(true)
+    try {
+      const subscriptions = await getAzureSubscriptions()
+      setSubscriptionOptions(subscriptions)
+      setSelectedSubscriptionIds([])
+      setSubscriptionSearch('')
+      setAssessmentName('')
+      setSubscriptionPickerOpen(true)
+    } catch (subscriptionError) {
+      setError(messageFromError(subscriptionError))
+    } finally {
+      setLoadingSubscriptions(false)
+    }
+  }
+
+  async function runScan(name: string, subscriptionIds: string[]) {
+    const normalizedName = name.trim()
+    setSubscriptionPickerOpen(false)
+    setActiveAssessment({
+      name: normalizedName,
+      subscriptionCount: subscriptionIds.length,
+    })
+    setScanning('live')
+    try {
+      const scan = await startScan({
+        mode: 'live',
+        assessmentName: normalizedName,
+        subscriptionIds,
+      })
       await refresh()
+      resetWorkspaceView()
       setNotice(
-        `${scan.mode === 'live' ? 'Live' : 'Demo'} scan completed: ${scan.recommendationsFound} findings across ${scan.subscriptionsDiscovered} subscriptions.`,
+        `Assessment completed: ${scan.recommendationsFound} findings across ${
+          scan.subscriptionsDiscovered
+        } ${
+          scan.subscriptionsDiscovered === 1
+            ? 'subscription'
+            : 'subscriptions'
+        }${
+          scan.warningCount
+            ? `, with ${scan.warningCount} coverage ${
+                scan.warningCount === 1 ? 'warning' : 'warnings'
+              }.`
+            : '.'
+        }`,
       )
     } catch (scanError) {
       setError(messageFromError(scanError))
     } finally {
-      setScanning(false)
+      setScanning(undefined)
+      setActiveAssessment(undefined)
+    }
+  }
+
+  async function runDemo() {
+    setNotice(undefined)
+    setError(undefined)
+    setScanning('demo')
+    try {
+      const scan = await startScan({
+        mode: 'demo',
+        assessmentName: 'Sample workspace',
+      })
+      await refresh()
+      resetWorkspaceView()
+      setNotice(
+        `Sample workspace loaded with ${scan.recommendationsFound} representative findings.`,
+      )
+    } catch (scanError) {
+      setError(messageFromError(scanError))
+    } finally {
+      setScanning(undefined)
+    }
+  }
+
+  async function retryDashboard() {
+    setLoading(true)
+    setError(undefined)
+    try {
+      await refresh()
+    } catch (requestError) {
+      setError(messageFromError(requestError))
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -237,6 +420,26 @@ function App() {
     document.documentElement.setAttribute('data-theme', nextTheme)
     setTheme(nextTheme)
   }
+
+  function resetWorkspaceView() {
+    setActiveView('overview')
+    setSelected(undefined)
+    setSearch('')
+    setCategory('all')
+    setStatus('active')
+    setSubscriptionId('all')
+    setMinimumConfidence(0)
+    setIncludeExcepted(false)
+  }
+
+  const connectionLabel = !authentication
+    ? 'Checking Azure'
+    : authentication.authenticated
+      ? authentication.source === 'azure_cli'
+        ? 'CLI connected'
+        : 'Azure connected'
+      : 'Connect Azure'
+  const hasAssessment = Boolean(overview?.estate.lastScanAt)
 
   async function addException(
     recommendationId: string,
@@ -300,33 +503,35 @@ function App() {
           <BrandMark />
         </div>
 
-        <nav className="mt-10 space-y-1">
-          {navigation.map((item) => {
-            const Icon = item.icon
-            const active = activeView === item.id
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={cn(
-                  'flex w-full items-center gap-3 rounded-[0.625rem] px-3 py-2.5 text-left text-sm font-semibold transition-colors',
-                  active
-                    ? 'bg-accent text-accent-foreground'
-                    : 'text-muted-foreground hover:bg-secondary hover:text-foreground',
-                )}
-                onClick={() => setActiveView(item.id)}
-              >
-                <Icon className="size-[18px]" aria-hidden="true" />
-                {item.label}
-                {item.id === 'findings' && overview && (
-                  <span className="ml-auto rounded-full border bg-card px-2 py-0.5 text-[11px] text-foreground">
-                    {overview.openRecommendations}
-                  </span>
-                )}
-              </button>
-            )
-          })}
-        </nav>
+        {hasAssessment && (
+          <nav className="mt-10 space-y-1">
+            {navigation.map((item) => {
+              const Icon = item.icon
+              const active = activeView === item.id
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={cn(
+                    'flex w-full items-center gap-3 rounded-[0.625rem] px-3 py-2.5 text-left text-sm font-semibold transition-colors',
+                    active
+                      ? 'bg-accent text-accent-foreground'
+                      : 'text-muted-foreground hover:bg-secondary hover:text-foreground',
+                  )}
+                  onClick={() => setActiveView(item.id)}
+                >
+                  <Icon className="size-[18px]" aria-hidden="true" />
+                  {item.label}
+                  {item.id === 'findings' && overview && (
+                    <span className="ml-auto rounded-full border bg-card px-2 py-0.5 text-[11px] text-foreground">
+                      {overview.openRecommendations}
+                    </span>
+                  )}
+                </button>
+              )
+            })}
+          </nav>
+        )}
 
         <div className="mt-auto space-y-3">
           <div className="rounded-xl border bg-secondary p-4">
@@ -361,26 +566,53 @@ function App() {
             </div>
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-bold text-foreground">
-                {overview?.estate.tenantName ?? 'Azure estate'}
+                {hasAssessment
+                  ? overview?.estate.assessmentName ??
+                    overview?.estate.tenantName ??
+                    'Azure estate'
+                  : 'Azure Prospector'}
               </div>
               <div className="truncate text-xs text-muted-foreground">
-                {overview
-                  ? `${overview.estate.subscriptions} subscriptions · last scan ${formatDate(
+                {hasAssessment && overview
+                  ? `${overview.estate.subscriptions} ${
+                      overview.estate.subscriptions === 1
+                        ? 'subscription'
+                        : 'subscriptions'
+                    } · last scan ${formatDate(
                       overview.estate.lastScanAt,
                       true,
                     )}`
-                  : 'Loading estate inventory'}
+                  : 'Ready for a new cost assessment'}
               </div>
             </div>
-            <select
-              aria-label="Scan mode"
-              className="hidden h-9 rounded-[0.625rem] border bg-card px-3 text-sm font-semibold text-foreground outline-none focus:ring-2 focus:ring-ring sm:block"
-              value={scanMode ?? overview?.estate.mode ?? 'demo'}
-              onChange={(event) => setScanMode(event.target.value as ScanMode)}
-            >
-              <option value="demo">Demo data</option>
-              <option value="live">Live Azure</option>
-            </select>
+            {overview?.estate.lastScanAt && (
+              <Badge variant="outline" className="hidden sm:inline-flex">
+                {overview.estate.mode === 'demo' ? 'Sample data' : 'Live data'}
+              </Badge>
+            )}
+            {authentication?.authenticated ? (
+              <Badge
+                variant="outline"
+                className="hidden gap-2 px-3 py-2 sm:inline-flex"
+                title={authentication.message}
+              >
+                <Cloud aria-hidden="true" />
+                {connectionLabel}
+              </Badge>
+            ) : (
+              <Button
+                disabled={connecting || loadingSubscriptions}
+                title={authentication?.message}
+                onClick={() => void connectAzure()}
+              >
+                {connecting ? (
+                  <LoaderCircle className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <LogIn aria-hidden="true" />
+                )}
+                <span className="hidden md:inline">{connectionLabel}</span>
+              </Button>
+            )}
             <Button
               variant="outline"
               size="icon"
@@ -393,37 +625,52 @@ function App() {
                 <Moon className="size-4" aria-hidden="true" />
               )}
             </Button>
-            <Button disabled={scanning} onClick={runScan}>
-              {scanning ? (
-                <LoaderCircle className="animate-spin" aria-hidden="true" />
-              ) : (
-                <Play aria-hidden="true" />
-              )}
-              <span className="hidden sm:inline">{scanning ? 'Scanning' : 'Run scan'}</span>
-            </Button>
+            {hasAssessment && (
+              <Button
+                disabled={Boolean(scanning) || loadingSubscriptions}
+                onClick={() => void openAssessment()}
+              >
+                {scanning === 'live' || loadingSubscriptions ? (
+                  <LoaderCircle className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <Play aria-hidden="true" />
+                )}
+                <span className="hidden sm:inline">
+                  {scanning === 'live'
+                    ? 'Scanning'
+                    : loadingSubscriptions
+                      ? 'Loading scope'
+                      : overview?.estate.mode === 'demo'
+                        ? 'Start live assessment'
+                        : 'New assessment'}
+                </span>
+              </Button>
+            )}
           </div>
 
-          <nav className="flex overflow-x-auto border-t px-3 lg:hidden">
-            {navigation.map((item) => {
-              const Icon = item.icon
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={cn(
-                    'flex shrink-0 items-center gap-2 border-b-2 px-3 py-3 text-xs font-semibold',
-                    activeView === item.id
-                      ? 'border-primary text-primary'
-                      : 'border-transparent text-muted-foreground',
-                  )}
-                  onClick={() => setActiveView(item.id)}
-                >
-                  <Icon className="size-4" aria-hidden="true" />
-                  {item.label}
-                </button>
-              )
-            })}
-          </nav>
+          {hasAssessment && (
+            <nav className="flex overflow-x-auto border-t px-3 lg:hidden">
+              {navigation.map((item) => {
+                const Icon = item.icon
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={cn(
+                      'flex shrink-0 items-center gap-2 border-b-2 px-3 py-3 text-xs font-semibold',
+                      activeView === item.id
+                        ? 'border-primary text-primary'
+                        : 'border-transparent text-muted-foreground',
+                    )}
+                    onClick={() => setActiveView(item.id)}
+                  >
+                    <Icon className="size-4" aria-hidden="true" />
+                    {item.label}
+                  </button>
+                )
+              })}
+            </nav>
+          )}
         </header>
 
         <main className="px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
@@ -456,8 +703,23 @@ function App() {
             </div>
           )}
 
-          {loading || !overview ? (
+          {loading ? (
             <LoadingState />
+          ) : !overview ? (
+            <DashboardUnavailable
+              busy={Boolean(scanning)}
+              onRetry={() => void retryDashboard()}
+              onDemo={() => void runDemo()}
+            />
+          ) : !overview.estate.lastScanAt ? (
+            <WelcomeView
+              authentication={authentication}
+              connecting={connecting || loadingSubscriptions}
+              scanning={scanning}
+              onConnect={() => void connectAzure()}
+              onLiveScan={() => void openAssessment()}
+              onDemo={() => void runDemo()}
+            />
           ) : (
             <>
               {activeView === 'overview' && (
@@ -500,14 +762,38 @@ function App() {
               {activeView === 'coverage' && (
                 <CoverageView
                   overview={overview}
-                  scanMode={scanMode ?? overview.estate.mode}
-                  onScanMode={setScanMode}
+                  authentication={authentication}
+                  connecting={connecting}
+                  onConnect={() => void connectAzure()}
                 />
               )}
             </>
           )}
         </main>
       </div>
+
+      <SubscriptionPicker
+        open={subscriptionPickerOpen}
+        subscriptions={subscriptionOptions}
+        selectedIds={selectedSubscriptionIds}
+        search={subscriptionSearch}
+        assessmentName={assessmentName}
+        busy={Boolean(scanning)}
+        onOpenChange={setSubscriptionPickerOpen}
+        onSelectedIdsChange={setSelectedSubscriptionIds}
+        onSearchChange={setSubscriptionSearch}
+        onAssessmentNameChange={setAssessmentName}
+        onSubmit={() =>
+          void runScan(assessmentName, selectedSubscriptionIds)
+        }
+      />
+
+      {scanning === 'live' && activeAssessment && (
+        <ScanProgress
+          assessmentName={activeAssessment.name}
+          subscriptionCount={activeAssessment.subscriptionCount}
+        />
+      )}
 
       <RecommendationDetail
         key={selected?.id ?? 'closed'}
@@ -665,6 +951,117 @@ function ActionsView({
   )
 }
 
+function WelcomeView({
+  authentication,
+  connecting,
+  scanning,
+  onConnect,
+  onLiveScan,
+  onDemo,
+}: {
+  authentication?: AuthStatusResponse
+  connecting: boolean
+  scanning?: ScanMode
+  onConnect: () => void
+  onLiveScan: () => void
+  onDemo: () => void
+}) {
+  const connected = authentication?.authenticated
+  return (
+    <div className="mx-auto flex min-h-[72vh] max-w-[1100px] items-center">
+      <div className="w-full">
+        <div className="mx-auto max-w-3xl text-center">
+          <div className="mx-auto flex size-14 items-center justify-center rounded-xl bg-accent text-accent-foreground">
+            <Pickaxe className="size-7" aria-hidden="true" />
+          </div>
+          <div className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-primary">
+            Azure cost intelligence
+          </div>
+          <h1 className="mt-3 text-balance text-4xl font-bold tracking-[-0.05em] text-foreground sm:text-5xl">
+            Find the gold hiding in your cloud bill.
+          </h1>
+          <p className="mx-auto mt-4 max-w-2xl text-sm leading-6 text-muted-foreground sm:text-base">
+            Run a focused assessment across the subscriptions you choose and
+            surface evidence-backed savings opportunities.
+          </p>
+        </div>
+
+        <div className="mt-10 grid gap-5 md:grid-cols-[minmax(0,1.25fr)_minmax(280px,0.75fr)]">
+          <Card className="border-primary">
+            <CardContent className="p-6 sm:p-7">
+              <div className="flex items-start gap-4">
+                <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-foreground">
+                  <Cloud className="size-5" aria-hidden="true" />
+                </span>
+                <div>
+                  <h2 className="text-lg font-bold text-foreground">
+                    {connected
+                      ? 'Choose subscriptions to assess'
+                      : 'Connect your Azure estate'}
+                  </h2>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    {connected
+                      ? `${authentication.message} Start a named assessment by choosing its project subscriptions.`
+                      : authentication?.message ??
+                        'Checking your current Azure CLI session.'}
+                  </p>
+                  <Button
+                    className="mt-5"
+                    disabled={connecting || Boolean(scanning)}
+                    onClick={connected ? onLiveScan : onConnect}
+                  >
+                    {connecting || scanning === 'live' ? (
+                      <LoaderCircle
+                        className="animate-spin"
+                        aria-hidden="true"
+                      />
+                    ) : connected ? (
+                      <Play aria-hidden="true" />
+                    ) : (
+                      <LogIn aria-hidden="true" />
+                    )}
+                    {scanning === 'live'
+                      ? 'Scanning Azure'
+                      : connected
+                        ? 'Choose subscriptions'
+                        : 'Connect Azure'}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-6 sm:p-7">
+              <Sparkles className="size-5 text-primary" aria-hidden="true" />
+              <h2 className="mt-4 text-base font-bold text-foreground">
+                Explore sample data
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                Load a clearly labelled demonstration workspace without
+                connecting to Azure.
+              </p>
+              <Button
+                className="mt-5"
+                variant="outline"
+                disabled={Boolean(scanning)}
+                onClick={onDemo}
+              >
+                {scanning === 'demo' ? (
+                  <LoaderCircle className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <Sparkles aria-hidden="true" />
+                )}
+                {scanning === 'demo' ? 'Loading sample' : 'Explore demo'}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function OverviewView({
   overview,
   topRecommendations,
@@ -676,9 +1073,32 @@ function OverviewView({
   onSelect: (recommendation: Recommendation) => void
   onNavigate: (view: View) => void
 }) {
-  const savingsRate = overview.estate.monthlyCost
-    ? (overview.savings.potentialMonthlySavings / overview.estate.monthlyCost) * 100
-    : 0
+  const savingsRates = overview.savings.byCurrency
+    .filter((summary) => summary.monthlyCost > 0)
+    .map(
+      (summary) =>
+        `${(
+          (summary.potentialMonthlySavings / summary.monthlyCost) *
+          100
+        ).toFixed(1)}% ${summary.currency}`,
+    )
+    .join(' · ')
+  const monthlyCosts = overview.savings.byCurrency
+    .map((summary) => ({
+      currency: summary.currency,
+      amount: summary.monthlyCost,
+    }))
+    .filter((amount) => amount.amount !== 0)
+  const potentialSavings = overview.savings.byCurrency.map((summary) => ({
+    currency: summary.currency,
+    amount: summary.potentialMonthlySavings,
+  }))
+  const verifiedSavings = overview.savings.byCurrency
+    .filter((summary) => summary.costTrend.length > 0)
+    .map((summary) => ({
+      currency: summary.currency,
+      amount: summary.realizedSavingsLast30Days,
+    }))
 
   return (
     <div className="mx-auto max-w-[1500px]">
@@ -704,33 +1124,21 @@ function OverviewView({
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
-          label="Monthly cloud cost"
-          value={formatCurrency(
-            overview.estate.monthlyCost,
-            overview.estate.currency,
-            true,
-          )}
+          label="Median monthly cloud cost"
+          value={formatCurrencyAmounts(monthlyCosts, true)}
           detail={`${overview.estate.resources.toLocaleString()} inventoried resources`}
           icon={WalletCards}
         />
         <StatCard
           label="Potential monthly savings"
-          value={formatCurrency(
-            overview.savings.potentialMonthlySavings,
-            overview.savings.currency,
-            true,
-          )}
-          detail={`${savingsRate.toFixed(1)}% of current run rate`}
+          value={formatCurrencyAmounts(potentialSavings, true)}
+          detail={savingsRates || 'No comparable run rate'}
           icon={TrendingDown}
           accent
         />
         <StatCard
           label="Verified savings"
-          value={formatCurrency(
-            overview.savings.realizedSavingsLast30Days,
-            overview.savings.currency,
-            true,
-          )}
+          value={formatCurrencyAmounts(verifiedSavings, true)}
           detail={`${overview.savings.verifiedMeasurementCount} verified cost periods`}
           icon={CircleDollarSign}
         />
@@ -745,10 +1153,17 @@ function OverviewView({
       <div className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.65fr)_minmax(320px,0.75fr)]">
         <Card>
           <CardContent className="p-5 sm:p-6">
-            <CostTrendChart
-              points={overview.costTrend}
-              currency={overview.estate.currency}
-            />
+            <div className="space-y-8">
+              {overview.savings.byCurrency
+                .filter((summary) => summary.costTrend.length > 0)
+                .map((summary) => (
+                  <CostTrendChart
+                    key={summary.currency}
+                    points={summary.costTrend}
+                    currency={summary.currency}
+                  />
+                ))}
+            </div>
           </CardContent>
         </Card>
         <Card>
@@ -760,10 +1175,14 @@ function OverviewView({
           </CardHeader>
           <CardContent className="space-y-3">
             {overview.categories
-              .filter((item) => item.estimatedMonthlySavings > 0)
+              .filter((item) =>
+                item.estimatedMonthlySavings.some(
+                  (amount) => amount.amount > 0,
+                ),
+              )
               .sort(
                 (left, right) =>
-                  right.estimatedMonthlySavings - left.estimatedMonthlySavings,
+                  right.recommendations - left.recommendations,
               )
               .slice(0, 6)
               .map((item) => (
@@ -780,9 +1199,8 @@ function OverviewView({
                     </div>
                   </div>
                   <div className="text-right text-sm font-bold text-foreground">
-                    {formatCurrency(
+                    {formatCurrencyAmounts(
                       item.estimatedMonthlySavings,
-                      overview.estate.currency,
                       true,
                     )}
                     <div className="text-[10px] font-normal text-muted-foreground">monthly</div>
@@ -799,7 +1217,7 @@ function OverviewView({
             <div>
               <CardTitle className="text-base">Best next moves</CardTitle>
               <p className="mt-1 text-sm text-muted-foreground">
-                Ranked by monthly value and confidence.
+                Ranked within each native billing currency.
               </p>
             </div>
             <Button variant="ghost" size="sm" onClick={() => onNavigate('findings')}>
@@ -870,10 +1288,7 @@ function FindingsView({
   onIncludeExcepted: (value: boolean) => void
   onSelect: (recommendation: Recommendation) => void
 }) {
-  const totalValue = recommendations.reduce(
-    (sum, recommendation) => sum + recommendation.estimatedMonthlySavings,
-    0,
-  )
+  const totalValue = amountsByCurrency(recommendations)
 
   return (
     <div className="mx-auto max-w-[1500px]">
@@ -963,7 +1378,7 @@ function FindingsView({
           <strong className="text-foreground">{recommendations.length}</strong> findings
         </span>
         <span className="font-semibold text-foreground">
-          {formatCurrency(totalValue, overview.estate.currency)} potential monthly value
+          {formatCurrencyAmounts(totalValue)} potential monthly value
         </span>
       </div>
 
@@ -977,6 +1392,18 @@ function FindingsView({
 }
 
 function SavingsView({ overview }: { overview: OverviewResponse }) {
+  const annualized = overview.savings.byCurrency.map((summary) => ({
+    currency: summary.currency,
+    amount: summary.annualizedPotentialSavings,
+  }))
+  const realizedLast30Days = overview.savings.byCurrency.map((summary) => ({
+    currency: summary.currency,
+    amount: summary.realizedSavingsLast30Days,
+  }))
+  const realizedAllTime = overview.savings.byCurrency.map((summary) => ({
+    currency: summary.currency,
+    amount: summary.realizedSavingsAllTime,
+  }))
   return (
     <div className="mx-auto max-w-[1500px]">
       <PageHeading
@@ -988,32 +1415,20 @@ function SavingsView({ overview }: { overview: OverviewResponse }) {
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Annualized opportunity"
-          value={formatCurrency(
-            overview.savings.annualizedPotentialSavings,
-            overview.savings.currency,
-            true,
-          )}
+          value={formatCurrencyAmounts(annualized, true)}
           detail="if current findings are implemented"
           icon={Gem}
           accent
         />
         <StatCard
           label="Realized, last 30 days"
-          value={formatCurrency(
-            overview.savings.realizedSavingsLast30Days,
-            overview.savings.currency,
-            true,
-          )}
+          value={formatCurrencyAmounts(realizedLast30Days, true)}
           detail="measured against approved baselines"
           icon={CircleDollarSign}
         />
         <StatCard
           label="Realized, all time"
-          value={formatCurrency(
-            overview.savings.realizedSavingsAllTime,
-            overview.savings.currency,
-            true,
-          )}
+          value={formatCurrencyAmounts(realizedAllTime, true)}
           detail="cumulative verified value"
           icon={BarChart3}
         />
@@ -1028,10 +1443,17 @@ function SavingsView({ overview }: { overview: OverviewResponse }) {
       <div className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.5fr)_minmax(360px,0.8fr)]">
         <Card>
           <CardContent className="p-5 sm:p-6">
-            <CostTrendChart
-              points={overview.costTrend}
-              currency={overview.estate.currency}
-            />
+            <div className="space-y-8">
+              {overview.savings.byCurrency
+                .filter((summary) => summary.costTrend.length > 0)
+                .map((summary) => (
+                  <CostTrendChart
+                    key={summary.currency}
+                    points={summary.costTrend}
+                    currency={summary.currency}
+                  />
+                ))}
+            </div>
           </CardContent>
         </Card>
         <Card>
@@ -1042,7 +1464,9 @@ function SavingsView({ overview }: { overview: OverviewResponse }) {
             {[...overview.subscriptions]
               .sort(
                 (left, right) =>
-                  right.potentialMonthlySavings - left.potentialMonthlySavings,
+                  left.currency.localeCompare(right.currency) ||
+                  right.potentialMonthlySavings -
+                    left.potentialMonthlySavings,
               )
               .map((subscription) => (
                 <div key={subscription.id} className="rounded-[0.625rem] border p-3">
@@ -1092,13 +1516,16 @@ function SavingsView({ overview }: { overview: OverviewResponse }) {
 
 function CoverageView({
   overview,
-  scanMode,
-  onScanMode,
+  authentication,
+  connecting,
+  onConnect,
 }: {
   overview: OverviewResponse
-  scanMode: ScanMode
-  onScanMode: (mode: ScanMode) => void
+  authentication?: AuthStatusResponse
+  connecting: boolean
+  onConnect: () => void
 }) {
+  const latestScan = overview.recentScans[0]
   return (
     <div className="mx-auto max-w-[1200px]">
       <PageHeading
@@ -1118,31 +1545,66 @@ function CoverageView({
         </Card>
 
         <div className="space-y-6">
+          {latestScan?.warnings.length ? (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">
+                  Assessment warnings
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ul className="space-y-2 text-xs leading-5 text-muted-foreground">
+                  {latestScan.warnings.map((warning) => (
+                    <li
+                      key={warning}
+                      className="rounded-[0.625rem] border bg-secondary p-3"
+                    >
+                      {warning}
+                    </li>
+                  ))}
+                </ul>
+              </CardContent>
+            </Card>
+          ) : null}
+
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Connection mode</CardTitle>
+              <CardTitle className="text-base">Azure connection</CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-2 gap-2">
-                {(['demo', 'live'] as const).map((mode) => (
-                  <button
-                    key={mode}
-                    type="button"
-                    className={cn(
-                      'rounded-[0.625rem] border px-4 py-3 text-left transition-colors',
-                      scanMode === mode
-                        ? 'border-primary bg-accent text-accent-foreground'
-                        : 'bg-card text-foreground hover:bg-secondary',
-                    )}
-                    onClick={() => onScanMode(mode)}
-                  >
-                    <div className="text-sm font-bold capitalize">{mode}</div>
-                    <div className="mt-1 text-xs text-muted-foreground">
-                      {mode === 'demo' ? 'Safe seeded workspace' : 'Read-only Azure APIs'}
-                    </div>
-                  </button>
-                ))}
+            <CardContent className="space-y-4">
+              <div className="flex items-start gap-3">
+                <span
+                  className={cn(
+                    'mt-1.5 size-2.5 shrink-0 rounded-full',
+                    authentication?.authenticated
+                      ? 'bg-success'
+                      : 'bg-muted-foreground',
+                  )}
+                />
+                <div className="min-w-0">
+                  <div className="text-sm font-bold text-foreground">
+                    {authentication?.authenticated
+                      ? authentication.source === 'azure_cli'
+                        ? 'Azure CLI connected'
+                        : 'Microsoft account connected'
+                      : 'Not connected'}
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                    {authentication?.message ??
+                      'Checking the current Azure CLI session.'}
+                  </p>
+                </div>
               </div>
+              {!authentication?.authenticated && (
+                <Button disabled={connecting} onClick={onConnect}>
+                  {connecting ? (
+                    <LoaderCircle className="animate-spin" aria-hidden="true" />
+                  ) : (
+                    <LogIn aria-hidden="true" />
+                  )}
+                  Connect Azure
+                </Button>
+              )}
             </CardContent>
           </Card>
 
@@ -1153,20 +1615,28 @@ function CoverageView({
             <CardContent className="space-y-4">
               <SetupStep
                 number="1"
-                title="Authenticate"
-                description="Use Azure CLI locally, workload identity in CI, or managed identity when hosted."
-                code="az login"
+                title="Connect Azure CLI"
+                description="Prospector checks your current Azure CLI session automatically and uses it when valid."
+                code="az login --use-device-code --allow-no-subscriptions"
               />
               <SetupStep
                 number="2"
+                title="Browser fallback"
+                description={
+                  authentication?.browserLoginAvailable
+                    ? 'If Azure CLI is unavailable, Connect Azure uses the supported Azure Identity browser flow with PKCE.'
+                    : 'Browser sign-in is disabled for this installation.'
+                }
+              />
+              <SetupStep
+                number="3"
                 title="Grant read access"
                 description="Reader, Cost Management Reader, and Monitoring Reader at the intended management-group or subscription scopes."
               />
               <SetupStep
-                number="3"
-                title="Run a live scan"
-                description="Set the tenant and auth mode, then select Live Azure in the header."
-                code="AZURE_TENANT_ID=<tenant-id>"
+                number="4"
+                title="Start an assessment"
+                description="Use New assessment in the header, then choose the project subscriptions. Prospector never requests Azure write permissions."
               />
               <div className="rounded-[0.625rem] border bg-secondary p-3 text-xs leading-5 text-muted-foreground">
                 Billing benefits and reservation utilization may require additional billing-scope
@@ -1268,6 +1738,41 @@ function LoadingState() {
       <p className="mt-2 text-sm text-muted-foreground">
         Loading cost, telemetry, ownership, and recommendation data.
       </p>
+    </div>
+  )
+}
+
+function DashboardUnavailable({
+  busy,
+  onRetry,
+  onDemo,
+}: {
+  busy: boolean
+  onRetry: () => void
+  onDemo: () => void
+}) {
+  return (
+    <div className="flex min-h-[70vh] flex-col items-center justify-center text-center">
+      <div className="flex size-14 items-center justify-center rounded-xl bg-secondary text-destructive">
+        <AlertCircle className="size-6" aria-hidden="true" />
+      </div>
+      <div className="mt-4 text-lg font-bold text-foreground">
+        Dashboard data is unavailable
+      </div>
+      <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
+        Retry the local data service, or open the sample workspace while Azure
+        remains untouched.
+      </p>
+      <div className="mt-5 flex gap-2">
+        <Button disabled={busy} onClick={onRetry}>
+          <RefreshCw aria-hidden="true" />
+          Retry
+        </Button>
+        <Button variant="outline" disabled={busy} onClick={onDemo}>
+          <Sparkles aria-hidden="true" />
+          Explore demo
+        </Button>
+      </div>
     </div>
   )
 }

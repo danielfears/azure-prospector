@@ -29,6 +29,8 @@ Azure Prospector does not attempt to replace those systems. It provides a persis
 - Persistent SQLite data store
 - Safe demo workspace populated with representative findings
 - Read-only live Azure collector using `@azure/identity`
+- CLI-first authentication with optional browser fallback
+- Named, searchable multi-subscription cost assessments
 - Visible-subscription discovery
 - Azure Advisor cost recommendation ingestion
 - Azure Resource Graph orphan-resource checks
@@ -51,10 +53,13 @@ Requirements:
 git clone https://github.com/danielfears/azure-prospector.git
 Set-Location azure-prospector
 npm install
-npm run dev
+npm run app
 ```
 
-Open `http://localhost:4310`. The default demo mode does not need Azure credentials and writes its local database to `data\azure-prospector.db`.
+`npm run app` starts Prospector and opens `http://localhost:4310`. It opens on a
+live-first connection screen; sample data is loaded only through the explicit
+**Explore demo** action. Local data is written to
+`data\azure-prospector.db`.
 
 Docker is also supported:
 
@@ -68,27 +73,40 @@ proxy before exposing it to another machine or network.
 
 ## Connect to Azure
 
-The lowest-friction local option is Azure CLI authentication:
+The lowest-friction local option is an existing Azure CLI session. Prospector
+checks it automatically on startup:
 
 ```powershell
-az login --tenant <tenant-id>
-Copy-Item .env.example .env
+az login --use-device-code --allow-no-subscriptions
+npm run app
 ```
 
-Set these values in `.env`:
+Choose **Run live scan**, name the assessment, search for the project or
+subscription name, and tick the subscriptions to include. Selections can span
+tenants available to the current Azure CLI account; Prospector scans each
+tenant scope with the appropriate credential and combines the results. If the
+CLI session expires, sign in again and use **Connect Azure** to recheck it.
 
-```dotenv
-PROSPECTOR_AUTH_MODE=azure-cli
-AZURE_TENANT_ID=<tenant-id>
-```
+Browser sign-in uses Azure Identity's supported
+`InteractiveBrowserCredential`, including its PKCE and loopback handling.
+Local use does not require Prospector to implement OAuth or store refresh
+tokens. When no project client ID is configured, Azure Identity uses its
+development application; a project-owned public client ID remains recommended
+for a branded production distribution. No client secret is used.
 
-Then run:
+For hosted deployments, use managed identity or workload identity instead of a
+client secret.
 
-```powershell
-npm run dev
-```
+### Authentication order
 
-For hosted deployments, use managed identity or workload identity instead of a client secret.
+The default `auto` mode is deliberately local-user friendly:
+
+1. Use a valid Azure CLI session without prompting.
+2. Fall back to browser sign-in when a browser client ID is configured.
+3. Show an actionable connection message when neither method is ready.
+
+Set `PROSPECTOR_AUTH_MODE` explicitly for unattended deployments that must use
+only managed identity or `DefaultAzureCredential`.
 
 ### Recommended read roles
 
@@ -107,13 +125,50 @@ Authentication alone does not grant access. The identity sees only subscriptions
 |---|---|---|
 | `PORT` | `4310` | HTTP listening port |
 | `PROSPECTOR_DB_PATH` | `data\azure-prospector.db` | SQLite database path |
-| `PROSPECTOR_AUTH_MODE` | `default` | `default`, `azure-cli`, `managed-identity`, or `interactive` |
-| `AZURE_TENANT_ID` | unset | Limits authentication to a tenant |
-| `AZURE_CLIENT_ID` | unset | User-assigned managed identity or interactive app client ID |
+| `PROSPECTOR_AUTH_MODE` | `auto` | `auto`, `azure-cli`, `browser`, `managed-identity`, or `default-credential` |
+| `AZURE_TENANT_ID` | unset | Optionally limits authentication and collection to one tenant |
+| `AZURE_CLIENT_ID` | unset | User-assigned managed identity client ID |
+| `PROSPECTOR_BROWSER_CLIENT_ID` | unset | Optional public client ID for a branded production broker flow |
+| `PROSPECTOR_REDIRECT_URI` | unset | Optional redirect registered for a custom public client |
 | `PROSPECTOR_SUBSCRIPTION_IDS` | unset | Optional comma-separated subscription allow-list |
 | `PROSPECTOR_OWNER_TAGS` | `owner,serviceOwner,applicationOwner,technicalOwner` | Ordered ownership tag keys |
+| `AZURE_COST_HISTORY_MONTHS` | `6` | Maximum completed months requested from Cost Management |
+| `AZURE_COST_QPU_BUDGET_PER_SCAN` | `480` | Conservative tenant-wide Query API budget used to adapt the history window |
+| `AZURE_COST_REQUEST_INTERVAL_MS` | adaptive | Optional minimum delay between subscription cost queries |
+| `AZURE_COST_PAGE_INTERVAL_MS` | `15500` | Delay between paginated requests for the same subscription scope |
+| `AZURE_HTTP_RETRY_ATTEMPTS` | `3` | Bounded retries for transient Azure responses |
+| `AZURE_MAX_RETRY_DELAY_MS` | `120000` | Maximum server-directed delay accepted within an interactive scan |
 
 See [`.env.example`](.env.example) for the complete template.
+
+## Cost evidence and throttling
+
+Prospector keeps cost evidence native to Azure: every subscription,
+recommendation, chart, and roll-up retains its source billing currency. Amounts
+in different currencies are displayed separately and are never converted or
+added together.
+
+Cost Management Query API usage is planned against its tenant-wide query
+processing unit (QPU) limits. Prospector requests only completed calendar
+months, up to six months for small scopes. It automatically shortens the history
+window for large estates to remain within a conservative 480-QPU scan budget,
+and paces requests against both QPU and request-count limits. It honours the
+Cost Management QPU, tenant, client-type, entity, and standard retry headers.
+For example:
+
+- two subscriptions use six completed months, consuming about 12 QPUs;
+- 122 subscriptions use three completed months, consuming about 366 QPUs;
+- very large estates receive partial cost coverage rather than an unsafe burst.
+
+Interactive scans are intentionally assessment-scoped: a project team can
+select its small set of subscriptions without forcing an estate-wide billing
+query. Portfolio-wide reporting should use scheduled exports and background
+ingestion rather than the interactive scan path.
+
+Azure refreshes cost data periodically, so repeatedly querying unchanged
+history adds load without improving the evidence. For production-scale
+ingestion, scheduled Cost Management exports remain the preferred future data
+source; the Query API is the low-friction local fallback.
 
 ## What confidence means
 
@@ -152,6 +207,7 @@ More detail is available in [`docs/architecture.md`](docs/architecture.md).
 ## Development
 
 ```powershell
+npm run app
 npm run dev
 npm test
 npm run lint

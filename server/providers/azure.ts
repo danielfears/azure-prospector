@@ -19,6 +19,7 @@ import type {
   SnapshotRecommendation,
   SnapshotSubscription,
 } from './types.js'
+import { configuredSubscriptionIds } from '../azure-config.js'
 
 const ARM_ORIGIN = 'https://management.azure.com'
 const ARM_SCOPE = 'https://management.azure.com/.default'
@@ -58,18 +59,32 @@ interface ResourceRecord {
 interface CostQueryResult {
   subscriptionId: string
   currency?: string
-  latestByResource: Map<string, number>
+  representativeByResource: Map<string, number>
   monthlyTotals: Map<string, number>
-  latestTotal: number
+  representativeTotal: number
 }
 
 class ArmRequestError extends Error {
   readonly status: number
+  readonly code?: string
+  readonly retryAfterSeconds?: number
 
-  constructor(status: number, operation: string) {
-    super(`${operation} failed with Azure HTTP status ${status}`)
+  constructor(
+    status: number,
+    operation: string,
+    code?: string,
+    retryAfterMilliseconds?: number,
+  ) {
+    super(
+      `${operation} failed with Azure HTTP status ${status}${code ? ` (${code})` : ''}`,
+    )
     this.name = 'ArmRequestError'
     this.status = status
+    this.code = code
+    this.retryAfterSeconds =
+      retryAfterMilliseconds === undefined
+        ? undefined
+        : Math.ceil(retryAfterMilliseconds / 1000)
   }
 }
 
@@ -108,17 +123,6 @@ function createCredential(requestedTenantId?: string): TokenCredential {
   }
 }
 
-function configuredSubscriptionIds(): Set<string> | undefined {
-  const configured = process.env.PROSPECTOR_SUBSCRIPTION_IDS
-  if (!configured?.trim()) return undefined
-  return new Set(
-    configured
-      .split(',')
-      .map((value) => value.trim().toLowerCase())
-      .filter(Boolean),
-  )
-}
-
 function ownerTagNames(): string[] {
   const configured = process.env.PROSPECTOR_OWNER_TAGS
   if (!configured?.trim()) return DEFAULT_OWNER_TAGS
@@ -147,6 +151,15 @@ function finiteNumber(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed
   }
   return undefined
+}
+
+function median(values: number[]): number {
+  if (!values.length) return 0
+  const sorted = [...values].sort((left, right) => left - right)
+  const midpoint = Math.floor(sorted.length / 2)
+  return sorted.length % 2
+    ? sorted[midpoint]!
+    : (sorted[midpoint - 1]! + sorted[midpoint]!) / 2
 }
 
 function monthlyPeriod(value: unknown): string | undefined {
@@ -404,24 +417,150 @@ function makeRecommendation(input: {
   }
 }
 
-async function mapConcurrent<T, R>(
-  values: T[],
-  limit: number,
-  mapper: (value: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(values.length)
-  let nextIndex = 0
-  async function worker(): Promise<void> {
-    while (nextIndex < values.length) {
-      const index = nextIndex
-      nextIndex += 1
-      results[index] = await mapper(values[index]!)
+function numericEnvironmentValue(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const configured = Number(process.env[name] ?? fallback)
+  return Number.isFinite(configured)
+    ? Math.max(minimum, Math.min(maximum, configured))
+    : fallback
+}
+
+function retryAfterMilliseconds(response: Response): number | undefined {
+  const delays: number[] = []
+  for (const header of [
+    'x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after',
+    'x-ms-ratelimit-microsoft.costmanagement-entity-retry-after',
+    'x-ms-ratelimit-microsoft.costmanagement-clienttype-retry-after',
+    'x-ms-ratelimit-microsoft.costmanagement-tenant-retry-after',
+  ]) {
+    const value = response.headers.get(header)
+    if (value !== null) {
+      const seconds = Number(value)
+      if (Number.isFinite(seconds) && seconds >= 0) {
+        delays.push(seconds * 1000)
+      }
     }
   }
-  await Promise.all(
-    Array.from({ length: Math.min(limit, values.length) }, () => worker()),
+
+  const retryAfter = response.headers.get('retry-after')
+  if (retryAfter) {
+    const seconds = Number(retryAfter)
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      delays.push(seconds * 1000)
+    } else {
+      const retryAt = Date.parse(retryAfter)
+      if (Number.isFinite(retryAt)) {
+        delays.push(Math.max(0, retryAt - Date.now()))
+      }
+    }
+  }
+  return delays.length ? Math.max(...delays) : undefined
+}
+
+async function azureErrorCode(response: Response): Promise<string | undefined> {
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.toLowerCase().includes('application/json')) return undefined
+  const payload = (await response.clone().json().catch(() => undefined)) as
+    | { error?: { code?: unknown } }
+    | undefined
+  return typeof payload?.error?.code === 'string'
+    ? payload.error.code.slice(0, 100)
+    : undefined
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds)
+  })
+}
+
+function isTransientStatus(status: number): boolean {
+  return [408, 429, 500, 502, 503, 504].includes(status)
+}
+
+function retryDelay(error: ArmRequestError, attempt: number): number {
+  if (error.retryAfterSeconds !== undefined) {
+    return error.retryAfterSeconds * 1000
+  }
+  return (
+    Math.min(10_000, 1000 * 2 ** attempt) +
+    Math.floor(Math.random() * 250)
   )
-  return results
+}
+
+export interface CostQueryPlan {
+  historyMonths: number
+  subscriptionsToQuery: number
+  estimatedQpu: number
+  minimumIntervalMilliseconds: number
+}
+
+class CostQueryBudgetExceededError extends Error {
+  constructor(readonly budget: number) {
+    super(`Cost Management query budget of ${budget} QPUs was exhausted`)
+    this.name = 'CostQueryBudgetExceededError'
+  }
+}
+
+class CostQueryBudget {
+  private consumed = 0
+
+  constructor(readonly limit: number) {}
+
+  get remaining(): number {
+    return this.limit - this.consumed
+  }
+
+  consume(units: number): void {
+    if (units > this.remaining) {
+      throw new CostQueryBudgetExceededError(this.limit)
+    }
+    this.consumed += units
+  }
+}
+
+interface RequestBudget {
+  qpuBudget: CostQueryBudget
+  qpuCost: number
+}
+
+export function createCostQueryPlan(
+  subscriptionCount: number,
+  maximumHistoryMonths = 6,
+  qpuBudget = 480,
+): CostQueryPlan {
+  const safeSubscriptionCount = Math.max(0, Math.floor(subscriptionCount))
+  const safeMaximumMonths = Math.max(1, Math.floor(maximumHistoryMonths))
+  const safeQpuBudget = Math.max(1, Math.floor(qpuBudget))
+  if (safeSubscriptionCount === 0) {
+    return {
+      historyMonths: 1,
+      subscriptionsToQuery: 0,
+      estimatedQpu: 0,
+      minimumIntervalMilliseconds: 1100,
+    }
+  }
+  const historyMonths = Math.max(
+    1,
+    Math.min(
+      safeMaximumMonths,
+      Math.floor(safeQpuBudget / safeSubscriptionCount),
+    ),
+  )
+  const subscriptionsToQuery = Math.min(
+    safeSubscriptionCount,
+    Math.floor(safeQpuBudget / historyMonths),
+  )
+  return {
+    historyMonths,
+    subscriptionsToQuery,
+    estimatedQpu: subscriptionsToQuery * historyMonths,
+    minimumIntervalMilliseconds: Math.max(3300, historyMonths * 1100),
+  }
 }
 
 export class AzureProvider implements ProspectorProvider {
@@ -435,7 +574,7 @@ export class AzureProvider implements ProspectorProvider {
     this.credential = credential ?? createCredential(requestedTenantId)
   }
 
-  private async request<T>(
+  private async requestOnce<T>(
     url: string,
     operation: string,
     init: RequestInit = {},
@@ -450,15 +589,58 @@ export class AzureProvider implements ProspectorProvider {
       ...init,
       headers: {
         Accept: 'application/json',
+        ClientType: 'AzureProspector',
         Authorization: `Bearer ${token.token}`,
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
         ...init.headers,
       },
     })
     if (!response.ok) {
-      throw new ArmRequestError(response.status, operation)
+      throw new ArmRequestError(
+        response.status,
+        operation,
+        await azureErrorCode(response),
+        retryAfterMilliseconds(response),
+      )
     }
     return (await response.json()) as T
+  }
+
+  private async request<T>(
+    url: string,
+    operation: string,
+    init: RequestInit = {},
+    budget?: RequestBudget,
+  ): Promise<T> {
+    const retryAttempts = numericEnvironmentValue(
+      'AZURE_HTTP_RETRY_ATTEMPTS',
+      3,
+      0,
+      6,
+    )
+    const maximumRetryDelay = numericEnvironmentValue(
+      'AZURE_MAX_RETRY_DELAY_MS',
+      120_000,
+      0,
+      300_000,
+    )
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        budget?.qpuBudget.consume(budget.qpuCost)
+        return await this.requestOnce<T>(url, operation, init)
+      } catch (error) {
+        if (
+          !(error instanceof ArmRequestError) ||
+          !isTransientStatus(error.status) ||
+          attempt >= retryAttempts
+        ) {
+          throw error
+        }
+        const delay = retryDelay(error, attempt)
+        if (delay > maximumRetryDelay) throw error
+        await sleep(delay)
+      }
+    }
   }
 
   private async discoverSubscriptions(
@@ -544,17 +726,26 @@ export class AzureProvider implements ProspectorProvider {
 
   private async queryCosts(
     subscription: ArmSubscription,
+    historyMonths: number,
+    qpuBudget: CostQueryBudget,
   ): Promise<CostQueryResult> {
     const now = new Date()
     const from = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 5, 1),
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth() - historyMonths,
+        1,
+      ),
+    )
+    const to = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) - 1,
     )
     const requestBody = JSON.stringify({
       type: 'AmortizedCost',
       timeframe: 'Custom',
       timePeriod: {
         from: from.toISOString(),
-        to: now.toISOString(),
+        to: to.toISOString(),
       },
       dataset: {
         granularity: 'Monthly',
@@ -575,20 +766,30 @@ export class AzureProvider implements ProspectorProvider {
       }
     }
     const responses: CostResponse[] = []
+    const pageInterval = numericEnvironmentValue(
+      'AZURE_COST_PAGE_INTERVAL_MS',
+      15_500,
+      0,
+      60_000,
+    )
+    let pageIndex = 0
     let nextUrl: string | undefined =
       `${ARM_ORIGIN}/subscriptions/${encodeURIComponent(subscription.subscriptionId)}` +
       `/providers/Microsoft.CostManagement/query?api-version=${COST_API_VERSION}`
     while (nextUrl) {
+      if (pageIndex > 0 && pageInterval > 0) await sleep(pageInterval)
       const response: CostResponse = await this.request(
         nextUrl,
         'Cost Management query',
         {
-        method: 'POST',
+          method: 'POST',
           body: requestBody,
         },
+        { qpuBudget, qpuCost: historyMonths },
       )
       responses.push(response)
       nextUrl = response.properties?.nextLink
+      pageIndex += 1
     }
     const columns = (responses[0]?.properties?.columns ?? []).map((column) =>
       (column.name ?? '').toLowerCase(),
@@ -640,10 +841,6 @@ export class AzureProvider implements ProspectorProvider {
     const currentPeriod =
       `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
     const completedPeriods = periods.filter((period) => period < currentPeriod)
-    const representativePeriod = completedPeriods.at(-1) ?? periods.at(-1)
-    const latestByResource = representativePeriod
-      ? (monthlyResourceCosts.get(representativePeriod) ?? new Map())
-      : new Map<string, number>()
     const trendPeriods = completedPeriods.length ? completedPeriods : periods
     const monthlyTotals = new Map(
       trendPeriods.map((period) => [
@@ -651,6 +848,22 @@ export class AzureProvider implements ProspectorProvider {
         [...(monthlyResourceCosts.get(period)?.values() ?? [])].reduce(
           (sum, cost) => sum + cost,
           0,
+        ),
+      ]),
+    )
+    const resourceIds = new Set(
+      trendPeriods.flatMap((period) => [
+        ...(monthlyResourceCosts.get(period)?.keys() ?? []),
+      ]),
+    )
+    const representativeByResource = new Map(
+      [...resourceIds].map((resourceId) => [
+        resourceId,
+        median(
+          trendPeriods.map(
+            (period) =>
+              monthlyResourceCosts.get(period)?.get(resourceId) ?? 0,
+          ),
         ),
       ]),
     )
@@ -665,12 +878,9 @@ export class AzureProvider implements ProspectorProvider {
     return {
       subscriptionId: subscription.subscriptionId,
       currency,
-      latestByResource,
+      representativeByResource,
       monthlyTotals,
-      latestTotal: [...latestByResource.values()].reduce(
-        (sum, cost) => sum + cost,
-        0,
-      ),
+      representativeTotal: median([...monthlyTotals.values()]),
     }
   }
 
@@ -699,33 +909,84 @@ export class AzureProvider implements ProspectorProvider {
       ]),
     )
 
-    const configuredConcurrency = Number(
-      process.env.AZURE_COST_CONCURRENCY ?? 3,
+    const maximumCostHistoryMonths = Math.floor(
+      numericEnvironmentValue(
+        'AZURE_COST_HISTORY_MONTHS',
+        6,
+        1,
+        12,
+      ),
     )
-    const concurrency = Number.isFinite(configuredConcurrency)
-      ? Math.max(1, Math.min(8, Math.floor(configuredConcurrency)))
-      : 3
-    const costAttempts = await mapConcurrent(
-      subscriptions,
-      concurrency,
-      async (subscription) => {
-        try {
-          return {
-            result: await this.queryCosts(subscription),
+    const costQpuBudget = Math.floor(
+      numericEnvironmentValue(
+        'AZURE_COST_QPU_BUDGET_PER_SCAN',
+        480,
+        1,
+        600,
+      ),
+    )
+    const costQueryPlan = createCostQueryPlan(
+      subscriptions.length,
+      maximumCostHistoryMonths,
+      costQpuBudget,
+    )
+    const costRequestInterval = numericEnvironmentValue(
+      'AZURE_COST_REQUEST_INTERVAL_MS',
+      costQueryPlan.minimumIntervalMilliseconds,
+      0,
+      30_000,
+    )
+    const costSubscriptions = subscriptions.slice(
+      0,
+      costQueryPlan.subscriptionsToQuery,
+    )
+    const qpuBudget = new CostQueryBudget(costQpuBudget)
+    if (costSubscriptions.length < subscriptions.length) {
+      warnings.push(
+        `Cost Management collection was limited to ${costSubscriptions.length} of ${subscriptions.length} subscriptions to stay within the configured ${costQpuBudget}-QPU scan budget.`,
+      )
+    }
+    const costAttempts: Array<{
+      result?: CostQueryResult
+      subscription: ArmSubscription
+    }> = []
+    for (const [index, subscription] of costSubscriptions.entries()) {
+      if (qpuBudget.remaining < costQueryPlan.historyMonths) {
+        warnings.push(
+          `Cost Management collection stopped after using the configured ${costQpuBudget}-QPU scan budget; remaining subscriptions retain inventory and Advisor coverage without cost history.`,
+        )
+        break
+      }
+      if (index > 0 && costRequestInterval > 0) {
+        await sleep(costRequestInterval)
+      }
+      try {
+        costAttempts.push({
+          result: await this.queryCosts(
             subscription,
-          }
-        } catch (error) {
-          const reason =
-            error instanceof ArmRequestError
-              ? `HTTP ${error.status}`
-              : 'authentication or connectivity error'
-          warnings.push(
-            `Cost Management data is unavailable for ${subscription.displayName} (${reason}).`,
-          )
-          return { subscription }
-        }
-      },
-    )
+            costQueryPlan.historyMonths,
+            qpuBudget,
+          ),
+          subscription,
+        })
+      } catch (error) {
+        const reason =
+          error instanceof CostQueryBudgetExceededError
+            ? `configured ${error.budget}-QPU scan budget exhausted`
+            : error instanceof ArmRequestError
+            ? `HTTP ${error.status}${error.code ? ` ${error.code}` : ''}${
+                error.retryAfterSeconds
+                  ? `; retry after ${error.retryAfterSeconds}s`
+                  : ''
+              }`
+            : 'authentication or connectivity error'
+        warnings.push(
+          `Cost Management data is unavailable for ${subscription.displayName} (${reason}).`,
+        )
+        costAttempts.push({ subscription })
+        if (error instanceof CostQueryBudgetExceededError) break
+      }
+    }
     const costResults = costAttempts
       .map((attempt) => attempt.result)
       .filter((result): result is CostQueryResult => result !== undefined)
@@ -737,10 +998,10 @@ export class AzureProvider implements ProspectorProvider {
       ),
     ]
     if (billingCurrencies.length > 1) {
-      throw new Error(
-        `Azure Prospector cannot aggregate multiple billing currencies in one scan (${billingCurrencies.join(
+      warnings.push(
+        `Native billing currencies are retained separately (${billingCurrencies.join(
           ', ',
-        )}). Use PROSPECTOR_SUBSCRIPTION_IDS or separate deployments to scan one currency at a time.`,
+        )}); no currency conversion is applied.`,
       )
     }
     const costBySubscription = new Map(
@@ -749,14 +1010,26 @@ export class AzureProvider implements ProspectorProvider {
         result,
       ]),
     )
+    const currencyBySubscription = new Map(
+      costResults
+        .filter(
+          (
+            result,
+          ): result is CostQueryResult & { currency: string } =>
+            Boolean(result.currency),
+        )
+        .map((result) => [
+          result.subscriptionId.toLowerCase(),
+          result.currency.trim().toUpperCase(),
+        ]),
+    )
+    const fallbackCurrency = billingCurrencies[0] ?? 'USD'
     const allResourceCosts = new Map<string, number>()
     for (const result of costResults) {
-      for (const [resourceId, cost] of result.latestByResource) {
+      for (const [resourceId, cost] of result.representativeByResource) {
         allResourceCosts.set(resourceId, cost)
       }
     }
-    let estateCurrency = billingCurrencies[0]
-
     const graphResults = new Map<string, unknown[]>()
     const graphQueries = [
       {
@@ -926,7 +1199,7 @@ export class AzureProvider implements ProspectorProvider {
           'annualSavingsAmount',
           'annualSavings',
         ])
-        let monthlySavings =
+        const monthlySavings =
           firstNumber(extended, [
             'monthlySavingsAmount',
             'savingsAmount',
@@ -942,36 +1215,30 @@ export class AzureProvider implements ProspectorProvider {
           'annualSavingsCurrency',
           'currency',
         ])?.toUpperCase()
-        if (
+        const currenciesConflict = Boolean(
           costCurrency &&
-          advisorCurrency &&
-          costCurrency !== advisorCurrency
-        ) {
-          throw new Error(
-            `Azure Advisor returned ${advisorCurrency} savings for ${subscription.displayName}, but Cost Management returned ${costCurrency}. Scan subscriptions with one billing currency at a time.`,
-          )
-        }
-        const recommendationCurrency = costCurrency ?? advisorCurrency
-        if (
-          recommendationCurrency &&
-          estateCurrency &&
-          recommendationCurrency !== estateCurrency
-        ) {
-          throw new Error(
-            `Azure Prospector cannot aggregate multiple billing currencies in one scan (${estateCurrency}, ${recommendationCurrency}). Use PROSPECTOR_SUBSCRIPTION_IDS or separate deployments to scan one currency at a time.`,
-          )
-        }
-        if (!estateCurrency && recommendationCurrency) {
-          estateCurrency = recommendationCurrency
-        }
-        if (monthlySavings > 0 && !recommendationCurrency) {
+            advisorCurrency &&
+            costCurrency !== advisorCurrency,
+        )
+        if (currenciesConflict) {
           warnings.push(
-            `Azure Advisor savings for ${subscription.displayName}/${resource.name} were excluded because no billing currency was available.`,
+            `Azure Advisor savings for ${subscription.displayName}/${resource.name} use ${advisorCurrency}, while Cost Management uses ${costCurrency}; both source amounts are retained without combining them.`,
           )
-          monthlySavings = 0
         }
+        const recommendationCurrency =
+          advisorCurrency ?? costCurrency ?? fallbackCurrency
+        if (
+          advisorCurrency &&
+          !currencyBySubscription.has(resource.subscriptionId.toLowerCase())
+        ) {
+          currencyBySubscription.set(
+            resource.subscriptionId.toLowerCase(),
+            advisorCurrency,
+          )
+        }
+        const comparableCurrentCost = currenciesConflict ? 0 : currentCost
         const confidence =
-          monthlySavings > 0 && currentCost > 0
+          monthlySavings > 0 && comparableCurrentCost > 0
             ? 0.9
             : monthlySavings > 0
               ? 0.78
@@ -1004,8 +1271,8 @@ export class AzureProvider implements ProspectorProvider {
             subscription,
             resource: impactedResource,
             savings: monthlySavings,
-            currentCost,
-            currency: recommendationCurrency ?? estateCurrency ?? 'USD',
+            currentCost: comparableCurrentCost,
+            currency: recommendationCurrency,
             confidence,
             effort: 'medium',
             risk: 'medium',
@@ -1024,7 +1291,7 @@ export class AzureProvider implements ProspectorProvider {
                     {
                       label: 'Estimated monthly savings',
                       value: monthlySavings,
-                      unit: recommendationCurrency ?? estateCurrency ?? 'USD',
+                      unit: recommendationCurrency,
                       source: 'Azure Advisor',
                       observedAt: collectedAt,
                     },
@@ -1037,7 +1304,6 @@ export class AzureProvider implements ProspectorProvider {
       }
     }
 
-    const currency = estateCurrency ?? 'USD'
     const orphanInputs = [
       {
         key: 'disks',
@@ -1075,6 +1341,10 @@ export class AzureProvider implements ProspectorProvider {
           resource.subscriptionId.toLowerCase(),
         )
         if (!subscription) continue
+        const currency =
+          currencyBySubscription.get(
+            resource.subscriptionId.toLowerCase(),
+          ) ?? fallbackCurrency
         const currentCost = resourceCost(resource.id, allResourceCosts)
         recommendations.push(
           makeRecommendation({
@@ -1103,7 +1373,7 @@ export class AzureProvider implements ProspectorProvider {
               ...(currentCost > 0
                 ? [
                     {
-                      label: 'Representative completed-month amortized cost',
+                      label: 'Median completed-month amortized cost',
                       value: currentCost,
                       unit: currency,
                       source: 'Cost Management',
@@ -1143,6 +1413,10 @@ export class AzureProvider implements ProspectorProvider {
           resource.subscriptionId.toLowerCase(),
         )
         if (!subscription) continue
+        const currency =
+          currencyBySubscription.get(
+            resource.subscriptionId.toLowerCase(),
+          ) ?? fallbackCurrency
         const currentCost = resourceCost(resource.id, allResourceCosts)
         recommendations.push(
           makeRecommendation({
@@ -1210,36 +1484,55 @@ export class AzureProvider implements ProspectorProvider {
         const owned = items.filter(
           (item) => item.owner.source !== 'unassigned',
         ).length
+        const currency =
+          currencyBySubscription.get(key) ?? fallbackCurrency
         return {
           id: subscription.subscriptionId,
           name: subscription.displayName,
+          tenantId: subscription.tenantId,
           state: subscription.state,
-          monthlyCost: costBySubscription.get(key)?.latestTotal ?? 0,
-          potentialMonthlySavings: items.reduce(
-            (sum, item) => sum + item.estimatedMonthlySavings,
-            0,
-          ),
+          monthlyCost:
+            costBySubscription.get(key)?.representativeTotal ?? 0,
+          potentialMonthlySavings: items
+            .filter((item) => item.currency === currency)
+            .reduce(
+              (sum, item) => sum + item.estimatedMonthlySavings,
+              0,
+            ),
           openRecommendations: items.length,
           ownerCoverage: items.length ? (owned / items.length) * 100 : 100,
-          currency: costBySubscription.get(key)?.currency ?? currency,
+          currency,
           resourceCount: resourceCounts.get(key) ?? 0,
         }
       },
     )
 
-    const monthlyTotals = new Map<string, number>()
+    const monthlyTotalsByCurrency = new Map<
+      string,
+      Map<string, number>
+    >()
     for (const result of costResults) {
+      const currency = result.currency?.trim().toUpperCase()
+      if (!currency) continue
+      const monthlyTotals =
+        monthlyTotalsByCurrency.get(currency) ?? new Map<string, number>()
       for (const [period, total] of result.monthlyTotals) {
         monthlyTotals.set(period, (monthlyTotals.get(period) ?? 0) + total)
       }
+      monthlyTotalsByCurrency.set(currency, monthlyTotals)
     }
-    const costTrend = [...monthlyTotals.entries()]
+    const currencyCostTrends = [...monthlyTotalsByCurrency.entries()]
       .sort(([left], [right]) => left.localeCompare(right))
-      .map(([period, actualCost]) => ({
-        period,
-        actualCost,
-        optimizedCost: actualCost,
-        realizedSavings: 0,
+      .map(([currency, monthlyTotals]) => ({
+        currency,
+        points: [...monthlyTotals.entries()]
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([period, actualCost]) => ({
+            period,
+            actualCost,
+            optimizedCost: actualCost,
+            realizedSavings: 0,
+          })),
       }))
 
     const graphSuccesses = graphQueries.filter((query) =>
@@ -1270,18 +1563,13 @@ export class AzureProvider implements ProspectorProvider {
       tenantId,
       tenantName: 'Connected Azure tenant',
       collectedAt,
-      currency,
       resources: [...resourceCounts.values()].reduce(
         (sum, count) => sum + count,
         0,
       ),
-      monthlyCost: snapshotSubscriptions.reduce(
-        (sum, subscription) => sum + subscription.monthlyCost,
-        0,
-      ),
       subscriptions: snapshotSubscriptions,
       recommendations,
-      costTrend,
+      currencyCostTrends,
       coverage: [
         {
           key: 'subscriptions',
@@ -1354,7 +1642,7 @@ export class AzureProvider implements ProspectorProvider {
         {
           key: 'cost-management',
           label: 'Cost visibility',
-          description: `${costResults.length} of ${subscriptions.length} subscriptions returned amortized cost.`,
+          description: `${costResults.length} of ${subscriptions.length} subscriptions returned up to ${costQueryPlan.historyMonths} completed months of amortized cost.`,
           percentage: costPercentage,
           status: coverageStatus(costPercentage),
           source: 'Cost Management',
@@ -1379,6 +1667,12 @@ export class AzureProvider implements ProspectorProvider {
       ],
       warnings,
       completeSourceFamilies,
+      completeSourceFamiliesBySubscription: Object.fromEntries(
+        subscriptions.map((subscription) => [
+          subscription.subscriptionId,
+          completeSourceFamilies,
+        ]),
+      ),
     }
   }
 }

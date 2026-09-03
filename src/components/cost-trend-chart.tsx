@@ -45,7 +45,9 @@ export function CostTrendChart({ points, currency }: CostTrendChartProps) {
     <div>
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-base font-semibold text-foreground">Cost trajectory</h2>
+          <h2 className="text-base font-semibold text-foreground">
+            {currency} cost trajectory
+          </h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Actual run rate against the optimized path.
           </p>

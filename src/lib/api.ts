@@ -2,6 +2,8 @@ import type {
   CreateActionRequest,
   CreateExceptionRequest,
   ActionStatus,
+  AuthStatusResponse,
+  AzureSubscriptionOption,
   OverviewResponse,
   Recommendation,
   RecommendationQuery,
@@ -49,6 +51,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function getOverview() {
   return request<OverviewResponse>('/api/overview')
+}
+
+export function getAuthStatus() {
+  return request<AuthStatusResponse>('/api/auth/status')
+}
+
+export function getAzureSubscriptions() {
+  return request<AzureSubscriptionOption[]>('/api/azure/subscriptions')
+}
+
+export function signInWithBrowser() {
+  return request<AuthStatusResponse>('/api/auth/login', {
+    method: 'POST',
+  })
 }
 
 export function getRecommendations(query: RecommendationQuery = {}) {

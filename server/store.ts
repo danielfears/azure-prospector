@@ -37,6 +37,21 @@ export interface ConnectionMetadata {
 interface ActiveScope {
   provider: string
   tenantId?: string
+  subscriptionIds?: string[]
+  assessmentName?: string
+}
+
+function subscriptionScope(
+  scope: ActiveScope,
+  alias = 'r',
+): { clause: string; params: string[] } {
+  if (!scope.subscriptionIds?.length) return { clause: '', params: [] }
+  return {
+    clause: ` AND ${alias}.subscription_id IN (${scope.subscriptionIds
+      .map(() => '?')
+      .join(', ')})`,
+    params: scope.subscriptionIds,
+  }
 }
 
 function asString(value: unknown): string {
@@ -113,12 +128,14 @@ export class ProspectorStore {
         mode TEXT NOT NULL CHECK (mode IN ('demo', 'live')),
         provider TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+        assessment_name TEXT,
         tenant_id TEXT,
         started_at TEXT NOT NULL,
         completed_at TEXT,
         subscriptions_discovered INTEGER NOT NULL DEFAULT 0,
         recommendations_found INTEGER NOT NULL DEFAULT 0,
         estimated_monthly_savings REAL NOT NULL DEFAULT 0,
+        estimated_savings_json TEXT NOT NULL DEFAULT '[]',
         warning_count INTEGER NOT NULL DEFAULT 0,
         warnings_json TEXT NOT NULL DEFAULT '[]',
         error TEXT
@@ -127,6 +144,7 @@ export class ProspectorStore {
       CREATE TABLE IF NOT EXISTS subscriptions (
         id TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
+        tenant_id TEXT,
         name TEXT NOT NULL,
         state TEXT NOT NULL,
         monthly_cost REAL NOT NULL DEFAULT 0,
@@ -201,6 +219,17 @@ export class ProspectorStore {
         PRIMARY KEY (provider, period)
       );
 
+      CREATE TABLE IF NOT EXISTS currency_cost_trend (
+        provider TEXT NOT NULL,
+        currency TEXT NOT NULL,
+        period TEXT NOT NULL,
+        actual_cost REAL NOT NULL,
+        optimized_cost REAL NOT NULL,
+        realized_savings REAL NOT NULL,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (provider, currency, period)
+      );
+
       CREATE TABLE IF NOT EXISTS exceptions (
         id TEXT PRIMARY KEY,
         recommendation_id TEXT NOT NULL UNIQUE,
@@ -252,6 +281,48 @@ export class ProspectorStore {
         SELECT RAISE(ABORT, 'recommendation confidence must be between 0 and 1');
       END;
     `)
+    const scanColumns = this.database
+      .prepare('PRAGMA table_info(scans)')
+      .all() as Row[]
+    if (
+      !scanColumns.some(
+        (column) => asString(column.name) === 'estimated_savings_json',
+      )
+    ) {
+      this.database.exec(
+        "ALTER TABLE scans ADD COLUMN estimated_savings_json TEXT NOT NULL DEFAULT '[]'",
+      )
+    }
+    if (
+      !scanColumns.some(
+        (column) => asString(column.name) === 'assessment_name',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE scans ADD COLUMN assessment_name TEXT',
+      )
+    }
+    const subscriptionColumns = this.database
+      .prepare('PRAGMA table_info(subscriptions)')
+      .all() as Row[]
+    if (
+      !subscriptionColumns.some(
+        (column) => asString(column.name) === 'tenant_id',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE subscriptions ADD COLUMN tenant_id TEXT',
+      )
+    }
+    this.database.exec(`
+      INSERT OR IGNORE INTO currency_cost_trend (
+        provider, currency, period, actual_cost, optimized_cost,
+        realized_savings, observed_at
+      )
+      SELECT provider, currency, period, actual_cost, optimized_cost,
+        realized_savings, observed_at
+      FROM cost_trend
+    `)
   }
 
   private isEmpty(): boolean {
@@ -297,7 +368,16 @@ export class ProspectorStore {
       this.getMetadata('mode') === 'live'
         ? this.getMetadata('tenant_id')
         : undefined
-    return { provider, tenantId }
+    const subscriptionIds = parseJson<string[]>(
+      this.getMetadata('subscription_ids') ?? '[]',
+    )
+    const assessmentName = this.getMetadata('assessment_name')
+    return {
+      provider,
+      tenantId,
+      ...(subscriptionIds.length ? { subscriptionIds } : {}),
+      ...(assessmentName ? { assessmentName } : {}),
+    }
   }
 
   getConnectionMetadata(): ConnectionMetadata {
@@ -315,16 +395,25 @@ export class ProspectorStore {
     mode: ScanMode,
     provider: string,
     tenantId?: string,
+    assessmentName?: string,
   ): ScanRecord {
     const id = randomUUID()
     const startedAt = new Date().toISOString()
     this.database
       .prepare(
         `INSERT INTO scans (
-          id, mode, provider, status, tenant_id, started_at, warnings_json
-        ) VALUES (?, ?, ?, 'running', ?, ?, '[]')`,
+          id, mode, provider, status, assessment_name, tenant_id, started_at,
+          warnings_json
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, '[]')`,
       )
-      .run(id, mode, provider, tenantId ?? null, startedAt)
+      .run(
+        id,
+        mode,
+        provider,
+        assessmentName ?? null,
+        tenantId ?? null,
+        startedAt,
+      )
     return this.getScan(id)
   }
 
@@ -367,7 +456,7 @@ export class ProspectorStore {
   }
 
   latestScan(scope?: ActiveScope): ScanRecord | undefined {
-    const clauses: string[] = []
+    const clauses: string[] = ["status = 'completed'"]
     const params: SqlValue[] = []
     if (scope) {
       clauses.push('provider = ?')
@@ -375,6 +464,10 @@ export class ProspectorStore {
       if (scope.tenantId) {
         clauses.push('tenant_id = ?')
         params.push(scope.tenantId)
+      }
+      if (scope.assessmentName) {
+        clauses.push('assessment_name = ?')
+        params.push(scope.assessmentName)
       }
     }
     const row = this.database
@@ -399,6 +492,10 @@ export class ProspectorStore {
         clauses.push('tenant_id = ?')
         params.push(scope.tenantId)
       }
+      if (scope.assessmentName) {
+        clauses.push('assessment_name = ?')
+        params.push(scope.assessmentName)
+      }
     }
     params.push(safeLimit)
     const rows = this.database
@@ -417,12 +514,16 @@ export class ProspectorStore {
       id: asString(row.id),
       mode: asString(row.mode) as ScanRecord['mode'],
       status: asString(row.status) as ScanRecord['status'],
+      assessmentName: asOptionalString(row.assessment_name),
       tenantId: asOptionalString(row.tenant_id),
       startedAt: asString(row.started_at),
       completedAt: asOptionalString(row.completed_at),
       subscriptionsDiscovered: asNumber(row.subscriptions_discovered),
       recommendationsFound: asNumber(row.recommendations_found),
       estimatedMonthlySavings: asNumber(row.estimated_monthly_savings),
+      estimatedMonthlySavingsByCurrency: parseJson(
+        row.estimated_savings_json ?? '[]',
+      ),
       warningCount: asNumber(row.warning_count),
       warnings: parseJson<string[]>(row.warnings_json),
       error: asOptionalString(row.error),
@@ -431,12 +532,13 @@ export class ProspectorStore {
 
   upsertCollectedSnapshot(scanId: string, snapshot: ProviderSnapshot): void {
     const runningScan = this.database
-      .prepare(`SELECT id FROM scans WHERE id = ? AND status = 'running'`)
-      .get(scanId)
+      .prepare(
+        `SELECT id, assessment_name
+         FROM scans
+         WHERE id = ? AND status = 'running'`,
+      )
+      .get(scanId) as Row | undefined
     if (!runningScan) throw new Error(`Running scan not found: ${scanId}`)
-    if (snapshot.mode === 'live' && !snapshot.tenantId) {
-      throw new Error('Live snapshots must include a tenant ID')
-    }
     for (const recommendation of snapshot.recommendations) {
       if (
         !Number.isFinite(recommendation.confidence) ||
@@ -455,9 +557,24 @@ export class ProspectorStore {
       this.setMetadata('mode', snapshot.mode, now)
       this.setMetadata('provider', snapshot.provider, now)
       this.setMetadata('tenant_name', snapshot.tenantName, now)
-      this.setMetadata('currency', snapshot.currency, now)
       this.setMetadata('resources', String(snapshot.resources), now)
-      this.setMetadata('monthly_cost', String(snapshot.monthlyCost), now)
+      const assessmentName = asOptionalString(
+        runningScan.assessment_name,
+      )
+      if (assessmentName) {
+        this.setMetadata('assessment_name', assessmentName, now)
+      } else {
+        this.database
+          .prepare('DELETE FROM metadata WHERE key = ?')
+          .run('assessment_name')
+      }
+      this.setMetadata(
+        'subscription_ids',
+        JSON.stringify(
+          snapshot.subscriptions.map((subscription) => subscription.id),
+        ),
+        now,
+      )
       if (snapshot.tenantId) {
         this.setMetadata('tenant_id', snapshot.tenantId, now)
       } else {
@@ -467,14 +584,15 @@ export class ProspectorStore {
       this.database.prepare('DELETE FROM subscriptions').run()
       const subscriptionStatement = this.database.prepare(
         `INSERT INTO subscriptions (
-          id, provider, name, state, monthly_cost, potential_monthly_savings,
+          id, provider, tenant_id, name, state, monthly_cost, potential_monthly_savings,
           open_recommendations, owner_coverage, currency, resource_count, observed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       for (const subscription of snapshot.subscriptions) {
         subscriptionStatement.run(
           subscription.id,
           snapshot.provider,
+          subscription.tenantId ?? snapshot.tenantId ?? null,
           subscription.name,
           subscription.state,
           subscription.monthlyCost,
@@ -509,22 +627,25 @@ export class ProspectorStore {
       }
 
       this.database.prepare('DELETE FROM cost_trend').run()
+      this.database.prepare('DELETE FROM currency_cost_trend').run()
       const trendStatement = this.database.prepare(
-        `INSERT INTO cost_trend (
-          provider, period, actual_cost, optimized_cost, realized_savings,
-          currency, observed_at
+        `INSERT INTO currency_cost_trend (
+          provider, currency, period, actual_cost, optimized_cost, realized_savings,
+          observed_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      for (const point of snapshot.costTrend) {
-        trendStatement.run(
-          snapshot.provider,
-          point.period,
-          point.actualCost,
-          point.optimizedCost,
-          point.realizedSavings,
-          snapshot.currency,
-          now,
-        )
+      for (const trend of snapshot.currencyCostTrends) {
+        for (const point of trend.points) {
+          trendStatement.run(
+            snapshot.provider,
+            trend.currency,
+            point.period,
+            point.actualCost,
+            point.optimizedCost,
+            point.realizedSavings,
+            now,
+          )
+        }
       }
 
       const recommendationStatement = this.database.prepare(`
@@ -595,9 +716,26 @@ export class ProspectorStore {
       const scannedSubscriptionIds = snapshot.subscriptions.map(
         (subscription) => subscription.id,
       )
-      for (const family of snapshot.completeSourceFamilies) {
-        if (scannedSubscriptionIds.length === 0) continue
-        const subscriptionPlaceholders = scannedSubscriptionIds
+      const completenessBySubscription = new Map(
+        Object.entries(
+          snapshot.completeSourceFamiliesBySubscription,
+        ).map(([subscriptionId, families]) => [
+          subscriptionId.toLowerCase(),
+          families,
+        ]),
+      )
+      const completeFamilies = new Set(
+        [...completenessBySubscription.values()].flat(),
+      )
+      for (const family of completeFamilies) {
+        const completeSubscriptionIds = scannedSubscriptionIds.filter(
+          (subscriptionId) =>
+            completenessBySubscription
+              .get(subscriptionId.toLowerCase())
+              ?.includes(family),
+        )
+        if (completeSubscriptionIds.length === 0) continue
+        const subscriptionPlaceholders = completeSubscriptionIds
           .map(() => '?')
           .join(', ')
         this.database
@@ -606,10 +744,6 @@ export class ProspectorStore {
              SET status = 'resolved', resolved_at = ?
              WHERE provider = ?
                AND source_family = ?
-               AND (
-                 (? IS NULL AND tenant_id IS NULL)
-                 OR tenant_id = ?
-               )
                AND subscription_id IN (${subscriptionPlaceholders})
                AND last_scan_id != ?
                AND status IN ('open', 'accepted', 'in_progress')`,
@@ -618,17 +752,31 @@ export class ProspectorStore {
             now,
             snapshot.provider,
             family,
-            snapshot.tenantId ?? null,
-            snapshot.tenantId ?? null,
-            ...scannedSubscriptionIds,
+            ...completeSubscriptionIds,
             scanId,
           )
       }
 
-      const estimatedSavings = snapshot.recommendations.reduce(
-        (sum, item) => sum + item.estimatedMonthlySavings,
-        0,
-      )
+      const estimatedSavingsByCurrency = [
+        ...snapshot.recommendations
+          .reduce((totals, item) => {
+            totals.set(
+              item.currency,
+              (totals.get(item.currency) ?? 0) +
+                item.estimatedMonthlySavings,
+            )
+            return totals
+          }, new Map<string, number>())
+          .entries(),
+      ]
+        .map(([currency, amount]) => ({ currency, amount }))
+        .sort((left, right) =>
+          left.currency.localeCompare(right.currency),
+        )
+      const estimatedSavings =
+        estimatedSavingsByCurrency.length === 1
+          ? estimatedSavingsByCurrency[0]!.amount
+          : 0
       this.database
         .prepare(
           `UPDATE scans SET
@@ -636,6 +784,7 @@ export class ProspectorStore {
             subscriptions_discovered = ?,
             recommendations_found = ?,
             estimated_monthly_savings = ?,
+            estimated_savings_json = ?,
             warning_count = ?,
             warnings_json = ?
            WHERE id = ?`,
@@ -645,6 +794,7 @@ export class ProspectorStore {
           snapshot.subscriptions.length,
           snapshot.recommendations.length,
           estimatedSavings,
+          JSON.stringify(estimatedSavingsByCurrency),
           snapshot.warnings.length,
           JSON.stringify(snapshot.warnings),
           scanId,
@@ -715,6 +865,14 @@ export class ProspectorStore {
       clauses.push('r.tenant_id = ?')
       params.push(scope.tenantId)
     }
+    if (scope.subscriptionIds?.length) {
+      clauses.push(
+        `r.subscription_id IN (${scope.subscriptionIds
+          .map(() => '?')
+          .join(', ')})`,
+      )
+      params.push(...scope.subscriptionIds)
+    }
 
     if (query.search) {
       clauses.push(
@@ -770,6 +928,7 @@ export class ProspectorStore {
     const now = new Date().toISOString()
     const scope = this.getActiveScope()
     const tenantClause = scope.tenantId ? ' AND r.tenant_id = ?' : ''
+    const subscriptions = subscriptionScope(scope)
     const row = this.database
       .prepare(
         `SELECT r.*, e.id AS exception_id, e.reason AS exception_reason,
@@ -780,9 +939,16 @@ export class ProspectorStore {
          ${activeExceptionJoin()}
          WHERE r.id = ?
            AND r.provider = ?
-           ${tenantClause}`,
+           ${tenantClause}
+           ${subscriptions.clause}`,
       )
-      .get(now, id, scope.provider, ...(scope.tenantId ? [scope.tenantId] : [])) as
+      .get(
+        now,
+        id,
+        scope.provider,
+        ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
+      ) as
       | Row
       | undefined
     return row ? this.recommendationFromRow(row) : undefined
@@ -935,6 +1101,7 @@ export class ProspectorStore {
   ): RemediationAction | undefined {
     const scope = this.getActiveScope()
     const tenantClause = scope.tenantId ? ' AND r.tenant_id = ?' : ''
+    const subscriptions = subscriptionScope(scope)
     const existing = this.database
       .prepare(
         `SELECT a.recommendation_id
@@ -942,9 +1109,15 @@ export class ProspectorStore {
          JOIN recommendations r ON r.id = a.recommendation_id
          WHERE a.id = ?
            AND r.provider = ?
-           ${tenantClause}`,
+           ${tenantClause}
+           ${subscriptions.clause}`,
       )
-      .get(id, scope.provider, ...(scope.tenantId ? [scope.tenantId] : [])) as
+      .get(
+        id,
+        scope.provider,
+        ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
+      ) as
       | Row
       | undefined
     if (!existing) return undefined
@@ -1017,6 +1190,7 @@ export class ProspectorStore {
   listActions(): RemediationAction[] {
     const scope = this.getActiveScope()
     const tenantClause = scope.tenantId ? ' AND r.tenant_id = ?' : ''
+    const subscriptions = subscriptionScope(scope)
     const rows = this.database
       .prepare(
         `SELECT a.*
@@ -1024,9 +1198,14 @@ export class ProspectorStore {
          JOIN recommendations r ON r.id = a.recommendation_id
          WHERE r.provider = ?
            ${tenantClause}
+           ${subscriptions.clause}
          ORDER BY a.created_at DESC, a.id DESC`,
       )
-      .all(scope.provider, ...(scope.tenantId ? [scope.tenantId] : [])) as Row[]
+      .all(
+        scope.provider,
+        ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
+      ) as Row[]
     return rows.map((row) => this.actionFromRow(row))
   }
 
@@ -1051,7 +1230,7 @@ export class ProspectorStore {
     const scope = this.getActiveScope()
     const provider = scope.provider
     const tenantClause = scope.tenantId ? ' AND r.tenant_id = ?' : ''
-    const currency = this.getMetadata('currency') ?? 'USD'
+    const subscriptions = subscriptionScope(scope)
     const now = new Date()
     const nowIso = now.toISOString()
     const expiringAt = new Date(now.getTime() + 30 * 86_400_000).toISOString()
@@ -1068,17 +1247,20 @@ export class ProspectorStore {
           COUNT(*) FILTER (
             WHERE r.status IN ('open', 'accepted', 'in_progress')
               AND r.owner_source = 'unassigned'
-          ) AS unowned_count,
-          COALESCE(SUM(r.estimated_monthly_savings) FILTER (
-            WHERE r.status IN ('open', 'accepted', 'in_progress')
-          ), 0) AS potential_savings
+          ) AS unowned_count
          FROM recommendations r
          ${activeExceptionJoin()}
          WHERE r.provider = ?
            ${tenantClause}
+           ${subscriptions.clause}
            AND e.id IS NULL`,
       )
-      .get(nowIso, provider, ...(scope.tenantId ? [scope.tenantId] : [])) as Row
+      .get(
+        nowIso,
+        provider,
+        ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
+      ) as Row
 
     const exceptionRow = this.database
       .prepare(
@@ -1087,41 +1269,49 @@ export class ProspectorStore {
          JOIN recommendations r ON r.id = e.recommendation_id
          WHERE r.provider = ?
            ${tenantClause}
+           ${subscriptions.clause}
            AND julianday(e.expires_at) > julianday(?)
            AND julianday(e.expires_at) <= julianday(?)`,
       )
       .get(
         provider,
         ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
         nowIso,
         expiringAt,
       ) as Row
 
     const categoryRows = this.database
       .prepare(
-        `SELECT category, COUNT(*) AS recommendations,
+        `SELECT category, r.currency, COUNT(*) AS recommendations,
           COALESCE(SUM(r.estimated_monthly_savings), 0) AS savings
          FROM recommendations r
          ${activeExceptionJoin()}
          WHERE r.provider = ?
            ${tenantClause}
+           ${subscriptions.clause}
            AND r.status IN ('open', 'accepted', 'in_progress')
            AND e.id IS NULL
-         GROUP BY r.category`,
+         GROUP BY r.category, r.currency`,
       )
       .all(
         nowIso,
         provider,
         ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
       ) as Row[]
-    const categoryMap = new Map(
-      categoryRows.map((row) => [asString(row.category), row]),
-    )
+    const categoryMap = new Map<string, Row[]>()
+    for (const row of categoryRows) {
+      const category = asString(row.category)
+      const rows = categoryMap.get(category) ?? []
+      rows.push(row)
+      categoryMap.set(category, rows)
+    }
 
     const subscriptionRows = this.database
       .prepare(
-        `SELECT s.id, s.name, s.state, s.monthly_cost, s.currency,
-          COALESCE(a.potential_monthly_savings, 0) AS potential_monthly_savings,
+        `SELECT s.id, s.tenant_id, s.name, s.state, s.monthly_cost, s.currency,
+          COALESCE(v.potential_monthly_savings, 0) AS potential_monthly_savings,
           COALESCE(a.open_recommendations, 0) AS open_recommendations,
           CASE
             WHEN COALESCE(a.open_recommendations, 0) = 0 THEN 100
@@ -1131,73 +1321,133 @@ export class ProspectorStore {
          LEFT JOIN (
            SELECT r.subscription_id,
              COUNT(*) AS open_recommendations,
-             COALESCE(SUM(r.estimated_monthly_savings), 0)
-               AS potential_monthly_savings,
              COUNT(*) FILTER (WHERE r.owner_source != 'unassigned')
                AS owned_recommendations
            FROM recommendations r
            ${activeExceptionJoin()}
            WHERE r.provider = ?
              ${tenantClause}
+             ${subscriptions.clause}
              AND r.status IN ('open', 'accepted', 'in_progress')
              AND e.id IS NULL
            GROUP BY r.subscription_id
          ) a ON a.subscription_id = s.id
+         LEFT JOIN (
+           SELECT r.subscription_id, r.currency,
+             COALESCE(SUM(r.estimated_monthly_savings), 0)
+               AS potential_monthly_savings
+           FROM recommendations r
+           ${activeExceptionJoin()}
+           WHERE r.provider = ?
+             ${tenantClause}
+             ${subscriptions.clause}
+             AND r.status IN ('open', 'accepted', 'in_progress')
+             AND e.id IS NULL
+           GROUP BY r.subscription_id, r.currency
+         ) v ON v.subscription_id = s.id AND v.currency = s.currency
          WHERE s.provider = ?
-         ORDER BY potential_monthly_savings DESC, s.name`,
+         ORDER BY s.currency, potential_monthly_savings DESC, s.name`,
       )
       .all(
         nowIso,
         provider,
         ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
+        nowIso,
+        provider,
+        ...(scope.tenantId ? [scope.tenantId] : []),
+        ...subscriptions.params,
         provider,
       ) as Row[]
 
     const trendRows = this.database
       .prepare(
-        `SELECT period, actual_cost, optimized_cost, realized_savings
-         FROM cost_trend
+        `SELECT currency, period, actual_cost, optimized_cost, realized_savings
+         FROM currency_cost_trend
          WHERE provider = ?
-         ORDER BY period`,
+         ORDER BY currency, period`,
       )
       .all(provider) as Row[]
     const coverage = this.database
       .prepare('SELECT * FROM coverage ORDER BY key')
       .all() as Row[]
 
-    const realizedAllTime = trendRows.reduce(
-      (sum, row) => sum + asNumber(row.realized_savings),
-      0,
-    )
-    const lastTrend = trendRows.at(-1)
     const verifiedPeriods = trendRows.filter(
       (row) => asNumber(row.realized_savings) > 0,
     ).length
     const measurementCoverage = trendRows.length
       ? (verifiedPeriods / trendRows.length) * 100
       : 0
-    const potentialSavings = asNumber(summary.potential_savings)
+    const potentialSavingsByCurrency = new Map<string, number>()
+    for (const row of categoryRows) {
+      const currencyCode = asString(row.currency)
+      potentialSavingsByCurrency.set(
+        currencyCode,
+        (potentialSavingsByCurrency.get(currencyCode) ?? 0) +
+          asNumber(row.savings),
+      )
+    }
+    const billingCurrencies = [
+      ...new Set(
+        [
+          ...subscriptionRows.map((row) => asString(row.currency)),
+          ...categoryRows.map((row) => asString(row.currency)),
+          ...trendRows.map((row) => asString(row.currency)),
+        ].filter(Boolean),
+      ),
+    ].sort()
+    const currencySummaries = billingCurrencies.map((currencyCode) => {
+      const currencyTrendRows = trendRows.filter(
+        (row) => asString(row.currency) === currencyCode,
+      )
+      const realizedSavingsAllTime = currencyTrendRows.reduce(
+        (sum, row) => sum + asNumber(row.realized_savings),
+        0,
+      )
+      const lastTrend = currencyTrendRows.at(-1)
+      const currencyVerifiedPeriods = currencyTrendRows.filter(
+        (row) => asNumber(row.realized_savings) > 0,
+      ).length
+      const potentialMonthlySavings =
+        potentialSavingsByCurrency.get(currencyCode) ?? 0
+      return {
+        currency: currencyCode,
+        monthlyCost: subscriptionRows
+          .filter((row) => asString(row.currency) === currencyCode)
+          .reduce((sum, row) => sum + asNumber(row.monthly_cost), 0),
+        potentialMonthlySavings,
+        annualizedPotentialSavings: potentialMonthlySavings * 12,
+        realizedSavingsLast30Days: lastTrend
+          ? asNumber(lastTrend.realized_savings)
+          : 0,
+        realizedSavingsAllTime,
+        verifiedMeasurementCount: currencyVerifiedPeriods,
+        measurementCoverage: currencyTrendRows.length
+          ? (currencyVerifiedPeriods / currencyTrendRows.length) * 100
+          : 0,
+        costTrend: currencyTrendRows.map((row) => ({
+          period: asString(row.period),
+          actualCost: asNumber(row.actual_cost),
+          optimizedCost: asNumber(row.optimized_cost),
+          realizedSavings: asNumber(row.realized_savings),
+        })),
+      }
+    })
     const latest = this.latestScan(scope)
 
     return {
       generatedAt: nowIso,
       estate: {
+        assessmentName: latest?.assessmentName,
         tenantName: this.getMetadata('tenant_name') ?? 'Azure Estate',
         mode: this.getMetadata('mode') === 'live' ? 'live' : 'demo',
         subscriptions: subscriptionRows.length,
         resources: Number(this.getMetadata('resources') ?? 0),
-        monthlyCost: Number(this.getMetadata('monthly_cost') ?? 0),
-        currency,
+        billingCurrencies,
         lastScanAt: latest?.completedAt ?? latest?.startedAt,
       },
       savings: {
-        currency,
-        potentialMonthlySavings: potentialSavings,
-        annualizedPotentialSavings: potentialSavings * 12,
-        realizedSavingsLast30Days: lastTrend
-          ? asNumber(lastTrend.realized_savings)
-          : 0,
-        realizedSavingsAllTime: realizedAllTime,
+        byCurrency: currencySummaries,
         verifiedMeasurementCount: verifiedPeriods,
         measurementCoverage,
       },
@@ -1206,17 +1456,28 @@ export class ProspectorStore {
       unownedRecommendations: asNumber(summary.unowned_count),
       expiringExceptions: asNumber(exceptionRow.count),
       categories: recommendationCategories.map((category) => {
-        const row = categoryMap.get(category)
+        const rows = categoryMap.get(category) ?? []
         return {
           category,
-          recommendations: row ? asNumber(row.recommendations) : 0,
-          estimatedMonthlySavings: row ? asNumber(row.savings) : 0,
+          recommendations: rows.reduce(
+            (sum, row) => sum + asNumber(row.recommendations),
+            0,
+          ),
+          estimatedMonthlySavings: rows
+            .map((row) => ({
+              currency: asString(row.currency),
+              amount: asNumber(row.savings),
+            }))
+            .sort((left, right) =>
+              left.currency.localeCompare(right.currency),
+            ),
         }
       }),
       subscriptions: subscriptionRows.map(
         (row): SubscriptionSummary => ({
           id: asString(row.id),
           name: asString(row.name),
+          tenantId: asOptionalString(row.tenant_id),
           state: asString(row.state),
           monthlyCost: asNumber(row.monthly_cost),
           potentialMonthlySavings: asNumber(
@@ -1227,12 +1488,6 @@ export class ProspectorStore {
           currency: asString(row.currency),
         }),
       ),
-      costTrend: trendRows.map((row) => ({
-        period: asString(row.period),
-        actualCost: asNumber(row.actual_cost),
-        optimizedCost: asNumber(row.optimized_cost),
-        realizedSavings: asNumber(row.realized_savings),
-      })),
       coverage: coverage.map(
         (row): CoverageItem => ({
           key: asString(row.key),

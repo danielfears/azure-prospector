@@ -483,19 +483,20 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
     existing.push(item)
     bySubscription.set(item.subscriptionId, existing)
   }
+  const completeSourceFamilies = [
+    'demo:advisor',
+    'demo:cost_management',
+    'demo:resource_graph',
+    'demo:prospector',
+  ]
 
   return {
     provider: 'demo',
     mode: 'demo',
     tenantName: 'Demo Azure Estate',
     collectedAt: observedAt,
-    currency: 'USD',
     resources: DEMO_SUBSCRIPTIONS.reduce(
       (sum, subscription) => sum + subscription.resourceCount,
-      0,
-    ),
-    monthlyCost: DEMO_SUBSCRIPTIONS.reduce(
-      (sum, subscription) => sum + subscription.monthlyCost,
       0,
     ),
     subscriptions: DEMO_SUBSCRIPTIONS.map((subscription) => {
@@ -515,7 +516,7 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
       }
     }),
     recommendations,
-    costTrend,
+    currencyCostTrends: [{ currency: 'USD', points: costTrend }],
     coverage: [
       {
         key: 'subscriptions',
@@ -552,12 +553,13 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
       },
     ],
     warnings: [],
-    completeSourceFamilies: [
-      'demo:advisor',
-      'demo:cost_management',
-      'demo:resource_graph',
-      'demo:prospector',
-    ],
+    completeSourceFamilies,
+    completeSourceFamiliesBySubscription: Object.fromEntries(
+      DEMO_SUBSCRIPTIONS.map((subscription) => [
+        subscription.id,
+        completeSourceFamilies,
+      ]),
+    ),
   }
 }
 

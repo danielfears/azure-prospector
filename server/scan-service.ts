@@ -53,6 +53,7 @@ export class ScanService {
         input.mode,
         providerName(input.mode),
         input.tenantId,
+        input.assessmentName,
       )
       const provider = this.providerFactories[input.mode](input)
       const snapshot = await provider.collect({

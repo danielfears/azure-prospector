@@ -1,6 +1,7 @@
 import type {
   ActionStatus,
   ConfidenceBand,
+  MonetaryAmount,
   RecommendationCategory,
   RecommendationStatus,
 } from '@/shared/types'
@@ -16,6 +17,19 @@ export function formatCurrency(
     maximumFractionDigits: compact ? 1 : 0,
     notation: compact ? 'compact' : 'standard',
   }).format(value)
+}
+
+export function formatCurrencyAmounts(
+  amounts: MonetaryAmount[],
+  compact = false,
+) {
+  if (!amounts.length) return 'No monetary data'
+  return [...amounts]
+    .sort((left, right) => left.currency.localeCompare(right.currency))
+    .map(({ amount, currency }) =>
+      formatCurrency(amount, currency, compact),
+    )
+    .join(' · ')
 }
 
 export function formatDate(value?: string, includeTime = false) {

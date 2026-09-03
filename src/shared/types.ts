@@ -26,6 +26,28 @@ export type Risk = 'low' | 'medium' | 'high'
 export type ScanMode = 'demo' | 'live'
 export type ScanStatus = 'running' | 'completed' | 'failed'
 export type ActionStatus = 'proposed' | 'approved' | 'running' | 'completed' | 'failed'
+export type AuthenticationSource =
+  | 'none'
+  | 'azure_cli'
+  | 'browser'
+  | 'managed_identity'
+  | 'default_credential'
+
+export interface AuthStatusResponse {
+  authenticated: boolean
+  source: AuthenticationSource
+  browserLoginAvailable: boolean
+  message: string
+}
+
+export interface AzureSubscriptionOption {
+  id: string
+  name: string
+  tenantId: string
+  tenantName: string
+  state: string
+  isDefault: boolean
+}
 
 export interface EvidencePoint {
   label: string
@@ -104,12 +126,14 @@ export interface ScanRecord {
   id: string
   mode: ScanMode
   status: ScanStatus
+  assessmentName?: string
   tenantId?: string
   startedAt: string
   completedAt?: string
   subscriptionsDiscovered: number
   recommendationsFound: number
   estimatedMonthlySavings: number
+  estimatedMonthlySavingsByCurrency: MonetaryAmount[]
   warningCount: number
   warnings: string[]
   error?: string
@@ -118,6 +142,7 @@ export interface ScanRecord {
 export interface SubscriptionSummary {
   id: string
   name: string
+  tenantId?: string
   state: string
   monthlyCost: number
   potentialMonthlySavings: number
@@ -143,29 +168,42 @@ export interface CostTrendPoint {
   realizedSavings: number
 }
 
-export interface CategorySummary {
-  category: RecommendationCategory
-  recommendations: number
-  estimatedMonthlySavings: number
+export interface MonetaryAmount {
+  currency: string
+  amount: number
 }
 
-export interface SavingsSummary {
+export interface CurrencyFinancialSummary {
   currency: string
+  monthlyCost: number
   potentialMonthlySavings: number
   annualizedPotentialSavings: number
   realizedSavingsLast30Days: number
   realizedSavingsAllTime: number
   verifiedMeasurementCount: number
   measurementCoverage: number
+  costTrend: CostTrendPoint[]
+}
+
+export interface CategorySummary {
+  category: RecommendationCategory
+  recommendations: number
+  estimatedMonthlySavings: MonetaryAmount[]
+}
+
+export interface SavingsSummary {
+  byCurrency: CurrencyFinancialSummary[]
+  verifiedMeasurementCount: number
+  measurementCoverage: number
 }
 
 export interface EstateSummary {
+  assessmentName?: string
   tenantName: string
   mode: ScanMode
   subscriptions: number
   resources: number
-  monthlyCost: number
-  currency: string
+  billingCurrencies: string[]
   lastScanAt?: string
 }
 
@@ -179,7 +217,6 @@ export interface OverviewResponse {
   expiringExceptions: number
   categories: CategorySummary[]
   subscriptions: SubscriptionSummary[]
-  costTrend: CostTrendPoint[]
   coverage: CoverageItem[]
   recentScans: ScanRecord[]
 }
@@ -209,6 +246,7 @@ export interface CreateActionRequest {
 
 export interface StartScanRequest {
   mode: ScanMode
+  assessmentName?: string
   tenantId?: string
   subscriptionIds?: string[]
 }
