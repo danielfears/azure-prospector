@@ -317,7 +317,7 @@ function App() {
             </p>
             <a
               className="mt-3 inline-flex items-center gap-1.5 text-xs font-semibold"
-              href="https://github.com/danielfears_microsoft/azure-prospector"
+              href="https://github.com/danielfears/azure-prospector"
               target="_blank"
               rel="noreferrer"
             >

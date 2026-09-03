@@ -48,7 +48,7 @@ Requirements:
 - npm
 
 ```powershell
-git clone https://github.com/danielfears_microsoft/azure-prospector.git
+git clone https://github.com/danielfears/azure-prospector.git
 Set-Location azure-prospector
 npm install
 npm run dev
