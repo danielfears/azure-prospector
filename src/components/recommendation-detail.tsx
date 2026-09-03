@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   BadgeCheck,
   Ban,
@@ -49,16 +49,10 @@ export function RecommendationDetail({
   const [mode, setMode] = useState<'details' | 'exception' | 'action'>('details')
   const [reason, setReason] = useState('')
   const [expiresAt, setExpiresAt] = useState('')
-  const [actionTitle, setActionTitle] = useState('')
+  const [actionTitle, setActionTitle] = useState(
+    recommendation?.suggestedAction ?? '',
+  )
   const [actionNotes, setActionNotes] = useState('')
-
-  useEffect(() => {
-    setMode('details')
-    setReason('')
-    setExpiresAt('')
-    setActionTitle(recommendation?.suggestedAction ?? '')
-    setActionNotes('')
-  }, [recommendation])
 
   if (!recommendation) return null
   const recommendationId = recommendation.id

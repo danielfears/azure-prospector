@@ -83,6 +83,14 @@ const navigation: Array<{
   { id: 'coverage', label: 'Coverage', icon: ShieldCheck },
 ]
 
+function loadDashboardData() {
+  return Promise.all([
+    getOverview(),
+    getRecommendations({ includeExcepted: true }),
+    getActions(),
+  ])
+}
+
 function App() {
   const [overview, setOverview] = useState<OverviewResponse>()
   const [recommendations, setRecommendations] = useState<Recommendation[]>([])
@@ -108,11 +116,8 @@ function App() {
 
   async function refresh(selectedId?: string) {
     try {
-      const [nextOverview, nextRecommendations, nextActions] = await Promise.all([
-        getOverview(),
-        getRecommendations({ includeExcepted: true }),
-        getActions(),
-      ])
+      const [nextOverview, nextRecommendations, nextActions] =
+        await loadDashboardData()
       setOverview(nextOverview)
       setRecommendations(nextRecommendations)
       setActions(nextActions)
@@ -129,7 +134,24 @@ function App() {
   }
 
   useEffect(() => {
-    void refresh()
+    let active = true
+    void loadDashboardData()
+      .then(([nextOverview, nextRecommendations, nextActions]) => {
+        if (!active) return
+        setOverview(nextOverview)
+        setRecommendations(nextRecommendations)
+        setActions(nextActions)
+        setScanMode(nextOverview.estate.mode)
+      })
+      .catch((requestError: unknown) => {
+        if (active) setError(messageFromError(requestError))
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
   }, [])
 
   const filteredRecommendations = useMemo(() => {
@@ -488,6 +510,7 @@ function App() {
       </div>
 
       <RecommendationDetail
+        key={selected?.id ?? 'closed'}
         recommendation={selected}
         open={Boolean(selected)}
         busy={mutating}
