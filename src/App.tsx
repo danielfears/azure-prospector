@@ -1220,14 +1220,22 @@ function OverviewView({
   onSelect: (recommendation: Recommendation) => void
   onNavigate: (view: View) => void
 }) {
-  const savingsRates = overview.savings.byCurrency
+  const comparableSavings = overview.savings.byCurrency.filter(
+    (summary) => summary.monthlyCost > 0,
+  )
+  const unbasedSavings = overview.savings.byCurrency.filter(
+    (summary) =>
+      summary.monthlyCost === 0 &&
+      summary.potentialMonthlySavings > 0,
+  )
+  const savingsRates = comparableSavings
     .filter((summary) => summary.monthlyCost > 0)
     .map(
       (summary) =>
         `${(
           (summary.potentialMonthlySavings / summary.monthlyCost) *
           100
-        ).toFixed(1)}% ${summary.currency}`,
+        ).toFixed(1)}% of ${summary.currency} run rate`,
     )
     .join(' · ')
   const monthlyCosts = overview.savings.byCurrency
@@ -1236,10 +1244,31 @@ function OverviewView({
       amount: summary.monthlyCost,
     }))
     .filter((amount) => amount.amount !== 0)
-  const potentialSavings = overview.savings.byCurrency.map((summary) => ({
+  const potentialSavings = (
+    comparableSavings.length
+      ? comparableSavings
+      : overview.savings.byCurrency
+  ).map((summary) => ({
     currency: summary.currency,
     amount: summary.potentialMonthlySavings,
   }))
+  const unbasedSavingsLabel = formatCurrencyAmounts(
+    unbasedSavings.map((summary) => ({
+      currency: summary.currency,
+      amount: summary.potentialMonthlySavings,
+    })),
+    true,
+  )
+  const opportunityDetail = [
+    savingsRates
+      ? `${savingsRates}, before overlap checks`
+      : 'No comparable cost baseline',
+    unbasedSavings.length
+      ? `${unbasedSavingsLabel} Advisor-only, without a matching cost baseline`
+      : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
   const verifiedSavings = overview.savings.byCurrency
     .filter((summary) => summary.costTrend.length > 0)
     .map((summary) => ({
@@ -1279,7 +1308,7 @@ function OverviewView({
         <StatCard
           label="Potential monthly savings"
           value={formatCurrencyAmounts(potentialSavings, true)}
-          detail={savingsRates || 'No comparable run rate'}
+          detail={opportunityDetail}
           icon={TrendingDown}
           accent
         />
