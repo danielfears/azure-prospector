@@ -314,13 +314,20 @@ function categoryForAdvisor(
   description: string,
 ): RecommendationCategory {
   if (
-    /reservation|savings plan|hybrid benefit|commitment/i.test(
+    /reservation|reserved instance|savings plan|hybrid benefit|commitment/i.test(
       `${title} ${description}`,
     )
   ) {
     return 'commitment'
   }
   return categoryForResource(resourceType)
+}
+
+function formatCommitmentTerm(value: string | undefined): string | undefined {
+  const match = /^P(\d+)Y$/i.exec(value ?? '')
+  if (!match) return value
+  const years = Number(match[1])
+  return `${years} ${years === 1 ? 'year' : 'years'}`
 }
 
 function resourceCost(
@@ -1238,13 +1245,28 @@ export class AzureProvider implements ProspectorProvider {
           )
         }
         const comparableCurrentCost = currenciesConflict ? 0 : currentCost
+        const term = formatCommitmentTerm(
+          firstString(extended, ['term']),
+        )
+        const lookbackPeriod = firstString(extended, [
+          'lookbackPeriod',
+        ])
+        const recommendedQuantity = firstString(extended, [
+          'qty',
+          'displayQty',
+        ])
+        const recommendedSku = firstString(extended, [
+          'sku',
+          'displaySKU',
+        ])
+        const recommendationRegion = firstString(extended, ['region'])
         const confidence =
           monthlySavings > 0 && comparableCurrentCost > 0
             ? 0.9
             : monthlySavings > 0
               ? 0.78
               : 0.62
-        const title =
+        const baseTitle =
           typeof shortDescription.solution === 'string'
             ? shortDescription.solution
             : 'Review Azure Advisor cost recommendation'
@@ -1252,6 +1274,15 @@ export class AzureProvider implements ProspectorProvider {
           typeof shortDescription.problem === 'string'
             ? shortDescription.problem
             : 'Azure Advisor identified a cost optimization opportunity.'
+        const scenario = [
+          term,
+          lookbackPeriod
+            ? `${lookbackPeriod}-day lookback`
+            : undefined,
+        ].filter(Boolean)
+        const title = scenario.length
+          ? `${baseTitle} (${scenario.join(', ')})`
+          : baseTitle
         recommendations.push(
           makeRecommendation({
             source: 'advisor',
@@ -1293,6 +1324,67 @@ export class AzureProvider implements ProspectorProvider {
                       label: 'Estimated monthly savings',
                       value: monthlySavings,
                       unit: recommendationCurrency,
+                      source: 'Azure Advisor',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(annualSavings !== undefined
+                ? [
+                    {
+                      label: 'Estimated annual savings',
+                      value: annualSavings,
+                      unit: recommendationCurrency,
+                      source: 'Azure Advisor',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(term
+                ? [
+                    {
+                      label: 'Commitment term',
+                      value: term,
+                      source: 'Azure Advisor',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(lookbackPeriod
+                ? [
+                    {
+                      label: 'Usage lookback',
+                      value: `${lookbackPeriod} days`,
+                      source: 'Azure Advisor',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(recommendedQuantity
+                ? [
+                    {
+                      label: 'Recommended quantity',
+                      value: recommendedQuantity,
+                      source: 'Azure Advisor',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(recommendedSku
+                ? [
+                    {
+                      label: 'Recommended SKU',
+                      value: recommendedSku,
+                      source: 'Azure Advisor',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(recommendationRegion
+                ? [
+                    {
+                      label: 'Recommendation region',
+                      value: recommendationRegion,
                       source: 'Azure Advisor',
                       observedAt: collectedAt,
                     },

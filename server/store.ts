@@ -93,6 +93,32 @@ function activeExceptionJoin(alias = 'e'): string {
     )`
 }
 
+function deduplicatedSavingsBy(
+  recommendations: Recommendation[],
+  group: (recommendation: Recommendation) => string,
+): Map<string, number> {
+  const bestByResource = new Map<string, number>()
+  for (const recommendation of recommendations) {
+    const groupKey = group(recommendation)
+    const resourceKey =
+      recommendation.resourceId ?? recommendation.fingerprint
+    const key = `${groupKey}\u0000${resourceKey}`
+    bestByResource.set(
+      key,
+      Math.max(
+        bestByResource.get(key) ?? 0,
+        recommendation.estimatedMonthlySavings,
+      ),
+    )
+  }
+  const totals = new Map<string, number>()
+  for (const [key, savings] of bestByResource) {
+    const groupKey = key.slice(0, key.lastIndexOf('\u0000'))
+    totals.set(groupKey, (totals.get(groupKey) ?? 0) + savings)
+  }
+  return totals
+}
+
 export function resolveDatabasePath(
   configuredPath = process.env.PROSPECTOR_DB_PATH,
 ): string {
@@ -1879,6 +1905,26 @@ export class ProspectorStore {
       rows.push(row)
       categoryMap.set(category, rows)
     }
+    const activeRecommendations = this.listRecommendations().filter(
+      (recommendation) =>
+        ['open', 'accepted', 'in_progress'].includes(
+          recommendation.status,
+        ),
+    )
+    const potentialSavingsByCurrency = deduplicatedSavingsBy(
+      activeRecommendations,
+      (recommendation) => recommendation.currency,
+    )
+    const potentialSavingsByCategory = deduplicatedSavingsBy(
+      activeRecommendations,
+      (recommendation) =>
+        `${recommendation.category}\u0000${recommendation.currency}`,
+    )
+    const potentialSavingsBySubscription = deduplicatedSavingsBy(
+      activeRecommendations,
+      (recommendation) =>
+        `${recommendation.subscriptionId}\u0000${recommendation.currency}`,
+    )
 
     const subscriptionRows = this.database
       .prepare(
@@ -1950,15 +1996,6 @@ export class ProspectorStore {
     const measurementCoverage = trendRows.length
       ? (verifiedPeriods / trendRows.length) * 100
       : 0
-    const potentialSavingsByCurrency = new Map<string, number>()
-    for (const row of categoryRows) {
-      const currencyCode = asString(row.currency)
-      potentialSavingsByCurrency.set(
-        currencyCode,
-        (potentialSavingsByCurrency.get(currencyCode) ?? 0) +
-          asNumber(row.savings),
-      )
-    }
     const billingCurrencies = [
       ...new Set(
         [
@@ -1969,12 +2006,7 @@ export class ProspectorStore {
       ),
     ].sort()
     const opportunityRatios = calculateOpportunityReductionRatios(
-      this.listRecommendations()
-        .filter((recommendation) =>
-          ['open', 'accepted', 'in_progress'].includes(
-            recommendation.status,
-          ),
-        ),
+      activeRecommendations,
       subscriptionRows.map((row) => ({
         currency: asString(row.currency),
         monthlyCost: asNumber(row.monthly_cost),
@@ -2055,7 +2087,10 @@ export class ProspectorStore {
           estimatedMonthlySavings: rows
             .map((row) => ({
               currency: asString(row.currency),
-              amount: asNumber(row.savings),
+              amount:
+                potentialSavingsByCategory.get(
+                  `${category}\u0000${asString(row.currency)}`,
+                ) ?? 0,
             }))
             .sort((left, right) =>
               left.currency.localeCompare(right.currency),
@@ -2070,7 +2105,9 @@ export class ProspectorStore {
           state: asString(row.state),
           monthlyCost: asNumber(row.monthly_cost),
           potentialMonthlySavings: asNumber(
-            row.potential_monthly_savings,
+            potentialSavingsBySubscription.get(
+              `${asString(row.id)}\u0000${asString(row.currency)}`,
+            ) ?? 0,
           ),
           openRecommendations: asNumber(row.open_recommendations),
           ownerCoverage: asNumber(row.owner_coverage),

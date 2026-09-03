@@ -37,6 +37,23 @@ interface RecommendationDetailProps {
   ) => Promise<void>
 }
 
+function confidenceExplanation(recommendation: Recommendation): string {
+  if (recommendation.source === 'advisor') {
+    return recommendation.currentMonthlyCost > 0
+      ? 'Azure Advisor supplied a quantified recommendation and Prospector matched the impacted resource to recent amortized cost evidence.'
+      : 'Azure Advisor supplied a quantified recommendation, but Prospector could not independently match this scope to a resource-level cost baseline. Treat the value as an option to validate, not bankable savings.'
+  }
+  if (recommendation.source === 'resource_graph') {
+    return recommendation.currentMonthlyCost > 0
+      ? 'Azure Resource Graph confirmed the configuration relationship and Cost Management confirmed continuing spend.'
+      : 'Azure Resource Graph confirmed the configuration relationship, but recent cost evidence was not available.'
+  }
+  if (recommendation.source === 'prospector') {
+    return 'Prospector inferred this lead from resource metadata. Workload intent, external automation, and utilization telemetry are not fully observable.'
+  }
+  return 'The score reflects the completeness and independence of the evidence attached to this finding.'
+}
+
 export function RecommendationDetail({
   recommendation,
   open,
@@ -83,7 +100,10 @@ export function RecommendationDetail({
       <DialogContent className="max-h-[92vh] max-w-3xl overflow-y-auto">
         <DialogHeader>
           <div className="mb-2 flex flex-wrap items-center gap-2">
-            <Badge>{Math.round(recommendation.confidence * 100)}% confidence</Badge>
+            <Badge>
+              {recommendation.confidenceBand} evidence ·{' '}
+              {Math.round(recommendation.confidence * 100)}%
+            </Badge>
             <Badge variant="secondary">{formatStatus(recommendation.status)}</Badge>
             <Badge variant="outline">{recommendation.source.replace('_', ' ')}</Badge>
           </div>
@@ -97,7 +117,7 @@ export function RecommendationDetail({
 
         {mode === 'details' && (
           <div className="space-y-6">
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Metric
                 icon={CircleDollarSign}
                 label="Monthly value"
@@ -107,12 +127,43 @@ export function RecommendationDetail({
                 )}
               />
               <Metric
+                icon={CircleDollarSign}
+                label="Cost baseline"
+                value={
+                  recommendation.currentMonthlyCost > 0
+                    ? formatCurrency(
+                        recommendation.currentMonthlyCost,
+                        recommendation.currency,
+                      )
+                    : 'Not matched'
+                }
+              />
+              <Metric
                 icon={ShieldAlert}
                 label="Change risk"
                 value={recommendation.risk}
               />
               <Metric icon={Wrench} label="Effort" value={recommendation.effort} />
             </div>
+
+            <section>
+              <h3 className="text-sm font-bold text-foreground">
+                Confidence explained
+              </h3>
+              <div className="mt-2 rounded-[0.625rem] border bg-secondary p-4">
+                <div className="text-sm font-bold capitalize text-foreground">
+                  {recommendation.confidenceBand} evidence confidence
+                </div>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  {confidenceExplanation(recommendation)}
+                </p>
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  This is an evidence-quality score, not the probability of
+                  achieving the estimated saving or a statement that the
+                  change is operationally safe.
+                </p>
+              </div>
+            </section>
 
             <section>
               <h3 className="text-sm font-bold text-foreground">Recommended action</h3>

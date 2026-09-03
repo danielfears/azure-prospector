@@ -208,6 +208,12 @@ describe('AzureProvider', () => {
                   extendedProperties: {
                     savingsAmount: '50',
                     savingsCurrency: 'EUR',
+                    annualSavingsAmount: '600',
+                    term: 'P3Y',
+                    lookbackPeriod: '30',
+                    qty: '2',
+                    sku: 'Example_SKU',
+                    region: 'westeurope',
                   },
                 },
               },
@@ -238,6 +244,26 @@ describe('AzureProvider', () => {
       snapshot.currencyCostTrends.map((trend) => trend.currency),
     ).toEqual(['GBP', 'USD'])
     expect(snapshot.recommendations[0]?.currency).toBe('EUR')
+    expect(snapshot.recommendations[0]?.evidence).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: 'Estimated annual savings',
+          value: 600,
+        }),
+        expect.objectContaining({
+          label: 'Commitment term',
+          value: '3 years',
+        }),
+        expect.objectContaining({
+          label: 'Usage lookback',
+          value: '30 days',
+        }),
+        expect.objectContaining({
+          label: 'Recommended SKU',
+          value: 'Example_SKU',
+        }),
+      ]),
+    )
     expect(
       snapshot.subscriptions.find((item) => item.id === 'sub-eur')
         ?.potentialMonthlySavings,

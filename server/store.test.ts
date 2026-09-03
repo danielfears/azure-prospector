@@ -346,6 +346,37 @@ describe('ProspectorStore', () => {
     }
   })
 
+  it('does not add alternative findings for the same resource together', () => {
+    const store = new ProspectorStore(':memory:', { seed: false })
+    try {
+      const snapshot = createDemoSnapshot(
+        new Date('2026-09-01T12:00:00.000Z'),
+      )
+      const original = snapshot.recommendations[0]!
+      snapshot.recommendations.push({
+        ...original,
+        id: 'alternative_scenario',
+        fingerprint: 'alternative_scenario_fingerprint',
+        estimatedMonthlySavings:
+          original.estimatedMonthlySavings - 1,
+      })
+      const scan = store.startScan('demo', 'demo')
+      store.completeScan(scan.id, snapshot)
+
+      const overview = store.getOverview()
+      expect(
+        overview.savings.byCurrency[0]?.potentialMonthlySavings,
+      ).toBe(6887)
+      expect(
+        overview.categories.find(
+          (item) => item.category === original.category,
+        )?.recommendations,
+      ).toBeGreaterThan(1)
+    } finally {
+      store.close()
+    }
+  })
+
   it('moves recommendation status with remediation action workflow', () => {
     const store = populatedStore()
     try {
