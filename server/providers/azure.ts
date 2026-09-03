@@ -1639,12 +1639,10 @@ export class AzureProvider implements ProspectorProvider {
           key: 'commitment-detail',
           label: 'Commitment detail',
           description:
-            'Reservation, savings plan, and contractual commitment details are not queried.',
+            'Requires billing-account or benefit-specific access that is outside this subscription-scoped assessment.',
           percentage: 0,
-          status: 'missing',
+          status: 'unavailable',
           source: 'Cost Management commitments',
-          action:
-            'Connect commitment utilization data before making commitment recommendations.',
         },
         {
           key: 'cost-management',

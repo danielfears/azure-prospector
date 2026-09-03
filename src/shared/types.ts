@@ -158,7 +158,7 @@ export interface CoverageItem {
   label: string
   description: string
   percentage: number
-  status: 'complete' | 'partial' | 'missing'
+  status: 'complete' | 'partial' | 'missing' | 'unavailable'
   source: string
   action?: string
 }

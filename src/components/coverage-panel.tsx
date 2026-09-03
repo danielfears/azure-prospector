@@ -1,4 +1,9 @@
-import { AlertTriangle, CheckCircle2, CircleDashed } from 'lucide-react'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  CircleDashed,
+  LockKeyhole,
+} from 'lucide-react'
 
 import { Progress } from '@/components/ui/progress'
 import { cn } from '@/lib/utils'
@@ -12,6 +17,7 @@ const statusIcon = {
   complete: CheckCircle2,
   partial: CircleDashed,
   missing: AlertTriangle,
+  unavailable: LockKeyhole,
 }
 
 export function CoveragePanel({ coverage }: CoveragePanelProps) {
@@ -29,6 +35,8 @@ export function CoveragePanel({ coverage }: CoveragePanelProps) {
                     item.status === 'complete' && 'text-success',
                     item.status === 'partial' && 'text-warning',
                     item.status === 'missing' && 'text-destructive',
+                    item.status === 'unavailable' &&
+                      'text-muted-foreground',
                   )}
                   aria-hidden="true"
                 />
@@ -40,10 +48,14 @@ export function CoveragePanel({ coverage }: CoveragePanelProps) {
                 </div>
               </div>
               <span className="shrink-0 text-sm font-bold text-foreground">
-                {Math.round(item.percentage)}%
+                {item.status === 'unavailable'
+                  ? 'N/A'
+                  : `${Math.round(item.percentage)}%`}
               </span>
             </div>
-            <Progress value={item.percentage} />
+            {item.status !== 'unavailable' && (
+              <Progress value={item.percentage} />
+            )}
             {item.action && (
               <p className="mt-1.5 pl-6 text-xs text-muted-foreground">{item.action}</p>
             )}

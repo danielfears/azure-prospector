@@ -102,6 +102,9 @@ function mergeCoverage(snapshots: ProviderSnapshot[]): CoverageItem[] {
         ) / totalSubscriptions
       : 0
     const action = items.find(({ item }) => item.action)?.item.action
+    const unavailable = items.every(
+      ({ item }) => item.status === 'unavailable',
+    )
     coverage.push({
       key,
       label: first.label,
@@ -110,8 +113,9 @@ function mergeCoverage(snapshots: ProviderSnapshot[]): CoverageItem[] {
           ? first.description
           : `${Math.round(percentage)}% coverage across ${totalSubscriptions} selected subscriptions in ${snapshots.length} tenants.`,
       percentage,
-      status:
-        percentage >= 99.5
+      status: unavailable
+        ? 'unavailable'
+        : percentage >= 99.5
           ? 'complete'
           : percentage > 0
             ? 'partial'
