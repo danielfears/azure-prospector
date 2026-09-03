@@ -16,6 +16,12 @@ import {
   AzureAuthenticationService,
 } from './auth-service.js'
 import { SelectedAzureProvider } from './providers/selected-azure.js'
+import {
+  createAssessmentReport,
+  createAssessmentReportFilename,
+  createFindingsCsv,
+  serializeAssessmentReport,
+} from './report-export.js'
 import { ScanInProgressError, ScanService } from './scan-service.js'
 import { ProspectorStore, resolveDatabasePath } from './store.js'
 
@@ -47,6 +53,7 @@ const startScanSchema = z.discriminatedUnion('mode', [
   z
     .object({
       mode: z.literal('live'),
+      assessmentId: z.string().uuid().optional(),
       assessmentName: z.string().trim().min(1).max(120),
       subscriptionIds: z
         .array(z.string().trim().min(1).max(200))
@@ -128,6 +135,22 @@ function sendError(
   sendJson(response, status, payload)
 }
 
+function sendDownload(
+  response: ServerResponse,
+  contentType: string,
+  filename: string,
+  body: string,
+): void {
+  response.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  })
+  response.end(body)
+}
+
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const contentLength = Number(request.headers['content-length'] ?? 0)
   if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
@@ -181,6 +204,22 @@ function routeId(pathname: string, suffix = ''): string | undefined {
   }
 }
 
+function assessmentRouteId(
+  pathname: string,
+  suffix = '',
+): string | undefined {
+  const escapedSuffix = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = new RegExp(
+    `^/api/assessments/([^/]+)${escapedSuffix}$`,
+  ).exec(pathname)
+  if (!match?.[1]) return undefined
+  try {
+    return decodeURIComponent(match[1])
+  } catch {
+    throw new HttpError(400, 'Route contains an invalid identifier')
+  }
+}
+
 async function handleApi(
   request: IncomingMessage,
   response: ServerResponse,
@@ -223,6 +262,102 @@ async function handleApi(
 
   if (method === 'GET' && url.pathname === '/api/overview') {
     sendJson(response, 200, store.getOverview())
+    return true
+  }
+
+  if (method === 'GET' && url.pathname === '/api/assessments') {
+    sendJson(response, 200, store.listAssessments())
+    return true
+  }
+
+  const exportAssessmentId = assessmentRouteId(
+    url.pathname,
+    '/export',
+  )
+  if (method === 'GET' && exportAssessmentId) {
+    const assessment = store.getAssessment(exportAssessmentId)
+    if (!assessment) throw new HttpError(404, 'Assessment not found')
+    const overview = store.getOverview()
+    if (overview.estate.assessmentId !== exportAssessmentId) {
+      throw new HttpError(
+        409,
+        'Open the assessment before exporting it',
+      )
+    }
+    const format = z
+      .enum(['json', 'csv'])
+      .parse(url.searchParams.get('format') ?? 'json')
+    const exportedAt = new Date()
+    const filename = createAssessmentReportFilename(
+      assessment.name,
+      format,
+      exportedAt,
+    )
+    const recommendations = store.listRecommendations({
+      includeExcepted: true,
+    })
+    if (format === 'csv') {
+      sendDownload(
+        response,
+        'text/csv; charset=utf-8',
+        filename,
+        createFindingsCsv(recommendations),
+      )
+      return true
+    }
+    const report = createAssessmentReport(
+      {
+        assessment: {
+          id: assessment.id,
+          name: assessment.name,
+        },
+        overview,
+        recommendations,
+        actions: store.listActions(),
+        scans: store.getAssessmentScans(assessment.id),
+      },
+      { exportedAt },
+    )
+    sendDownload(
+      response,
+      'application/json; charset=utf-8',
+      filename,
+      serializeAssessmentReport(report),
+    )
+    return true
+  }
+
+  const assessmentId = assessmentRouteId(url.pathname)
+  if (method === 'POST' && assessmentId) {
+    if (scans.isRunning) {
+      throw new HttpError(
+        409,
+        'Wait for the running assessment to finish before opening another',
+      )
+    }
+    const assessment = store.getAssessment(assessmentId)
+    if (!assessment) throw new HttpError(404, 'Assessment not found')
+    if (assessment.status !== 'completed') {
+      throw new HttpError(409, 'Only completed assessments can be opened')
+    }
+    sendJson(response, 200, store.activateAssessment(assessmentId))
+    return true
+  }
+  if (method === 'DELETE' && assessmentId) {
+    if (scans.isRunning) {
+      throw new HttpError(
+        409,
+        'Wait for the running assessment to finish before deleting it',
+      )
+    }
+    if (!store.deleteAssessment(assessmentId)) {
+      throw new HttpError(404, 'Assessment not found')
+    }
+    response.writeHead(204, {
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    })
+    response.end()
     return true
   }
 

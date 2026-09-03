@@ -47,6 +47,7 @@ export interface AzureSubscriptionOption {
   tenantName: string
   state: string
   isDefault: boolean
+  authenticationStatus: 'ready' | 'refresh_required'
 }
 
 export interface EvidencePoint {
@@ -124,6 +125,7 @@ export interface RemediationAction {
 
 export interface ScanRecord {
   id: string
+  assessmentId?: string
   mode: ScanMode
   status: ScanStatus
   assessmentName?: string
@@ -198,6 +200,7 @@ export interface SavingsSummary {
 }
 
 export interface EstateSummary {
+  assessmentId?: string
   assessmentName?: string
   tenantName: string
   mode: ScanMode
@@ -246,9 +249,24 @@ export interface CreateActionRequest {
 
 export interface StartScanRequest {
   mode: ScanMode
+  assessmentId?: string
   assessmentName?: string
   tenantId?: string
   subscriptionIds?: string[]
+}
+
+export interface AssessmentSummary {
+  id: string
+  name: string
+  mode: ScanMode
+  status: ScanStatus
+  selectedSubscriptionIds: string[]
+  subscriptionsDiscovered: number
+  recommendationsFound: number
+  warningCount: number
+  createdAt: string
+  updatedAt: string
+  lastScanAt?: string
 }
 
 export interface HealthResponse {

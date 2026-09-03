@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import {
   recommendationCategories,
   type ActionStatus,
+  type AssessmentSummary,
   type CoverageItem,
   type ExceptionRecord,
   type OverviewResponse,
@@ -36,9 +37,21 @@ export interface ConnectionMetadata {
 
 interface ActiveScope {
   provider: string
+  assessmentId?: string
   tenantId?: string
   subscriptionIds?: string[]
   assessmentName?: string
+}
+
+interface WorkspaceSnapshot {
+  metadata: Row[]
+  subscriptions: Row[]
+  recommendations: Row[]
+  coverage: Row[]
+  currencyCostTrend: Row[]
+  costTrend: Row[]
+  exceptions: Row[]
+  remediationActions: Row[]
 }
 
 function subscriptionScope(
@@ -123,12 +136,29 @@ export class ProspectorStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS assessments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('demo', 'live')),
+        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+        selected_subscription_ids_json TEXT NOT NULL DEFAULT '[]',
+        subscriptions_discovered INTEGER NOT NULL DEFAULT 0,
+        recommendations_found INTEGER NOT NULL DEFAULT 0,
+        warning_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_scan_at TEXT,
+        workspace_json TEXT NOT NULL DEFAULT '{}'
+      );
+
       CREATE TABLE IF NOT EXISTS scans (
         id TEXT PRIMARY KEY,
+        assessment_id TEXT,
         mode TEXT NOT NULL CHECK (mode IN ('demo', 'live')),
         provider TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
         assessment_name TEXT,
+        selected_subscription_ids_json TEXT NOT NULL DEFAULT '[]',
         tenant_id TEXT,
         started_at TEXT NOT NULL,
         completed_at TEXT,
@@ -266,7 +296,6 @@ export class ProspectorStore {
         ON remediation_actions(recommendation_id);
       CREATE INDEX IF NOT EXISTS idx_scans_started
         ON scans(started_at DESC);
-
       CREATE TRIGGER IF NOT EXISTS recommendations_confidence_insert
       BEFORE INSERT ON recommendations
       WHEN NEW.confidence < 0 OR NEW.confidence > 1
@@ -286,6 +315,19 @@ export class ProspectorStore {
       .all() as Row[]
     if (
       !scanColumns.some(
+        (column) => asString(column.name) === 'assessment_id',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE scans ADD COLUMN assessment_id TEXT',
+      )
+    }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS idx_scans_assessment
+        ON scans(assessment_id, started_at DESC)
+    `)
+    if (
+      !scanColumns.some(
         (column) => asString(column.name) === 'estimated_savings_json',
       )
     ) {
@@ -300,6 +342,16 @@ export class ProspectorStore {
     ) {
       this.database.exec(
         'ALTER TABLE scans ADD COLUMN assessment_name TEXT',
+      )
+    }
+    if (
+      !scanColumns.some(
+        (column) =>
+          asString(column.name) === 'selected_subscription_ids_json',
+      )
+    ) {
+      this.database.exec(
+        "ALTER TABLE scans ADD COLUMN selected_subscription_ids_json TEXT NOT NULL DEFAULT '[]'",
       )
     }
     const subscriptionColumns = this.database
@@ -323,6 +375,384 @@ export class ProspectorStore {
         realized_savings, observed_at
       FROM cost_trend
     `)
+    const recoveredAt = new Date().toISOString()
+    this.database
+      .prepare(
+        `UPDATE scans
+         SET status = 'failed', completed_at = ?,
+           error = 'Scan was interrupted before the application restarted'
+         WHERE status = 'running'`,
+      )
+      .run(recoveredAt)
+    this.database
+      .prepare(
+        `UPDATE assessments
+         SET status = CASE
+             WHEN last_scan_at IS NULL THEN 'failed'
+             ELSE 'completed'
+           END,
+           updated_at = ?
+         WHERE status = 'running'`,
+      )
+      .run(recoveredAt)
+    this.migrateLegacyAssessment()
+  }
+
+  private captureWorkspace(): WorkspaceSnapshot {
+    return {
+      metadata: this.database
+        .prepare(
+          `SELECT * FROM metadata
+           WHERE key != 'active_assessment_id'`,
+        )
+        .all() as Row[],
+      subscriptions: this.database
+        .prepare('SELECT * FROM subscriptions')
+        .all() as Row[],
+      recommendations: this.database
+        .prepare('SELECT * FROM recommendations')
+        .all() as Row[],
+      coverage: this.database
+        .prepare('SELECT * FROM coverage')
+        .all() as Row[],
+      currencyCostTrend: this.database
+        .prepare('SELECT * FROM currency_cost_trend')
+        .all() as Row[],
+      costTrend: this.database
+        .prepare('SELECT * FROM cost_trend')
+        .all() as Row[],
+      exceptions: this.database
+        .prepare('SELECT * FROM exceptions')
+        .all() as Row[],
+      remediationActions: this.database
+        .prepare('SELECT * FROM remediation_actions')
+        .all() as Row[],
+    }
+  }
+
+  private clearWorkspace(): void {
+    for (const table of [
+      'remediation_actions',
+      'exceptions',
+      'recommendations',
+      'subscriptions',
+      'coverage',
+      'currency_cost_trend',
+      'cost_trend',
+    ]) {
+      this.database.exec(`DELETE FROM ${table}`)
+    }
+    this.database.exec('DELETE FROM metadata')
+  }
+
+  private insertRows(table: string, rows: Row[]): void {
+    if (!rows.length) return
+    const validColumns = new Set(
+      (
+        this.database
+          .prepare(`PRAGMA table_info(${table})`)
+          .all() as Row[]
+      ).map((column) => asString(column.name)),
+    )
+    const columns = Object.keys(rows[0]!).filter((column) =>
+      validColumns.has(column),
+    )
+    if (!columns.length) return
+    const statement = this.database.prepare(
+      `INSERT INTO ${table} (${columns.join(', ')})
+       VALUES (${columns.map(() => '?').join(', ')})`,
+    )
+    for (const row of rows) {
+      statement.run(
+        ...columns.map((column) => {
+          const value = row[column]
+          if (
+            value === null ||
+            typeof value === 'string' ||
+            typeof value === 'number'
+          ) {
+            return value
+          }
+          throw new Error(
+            `Assessment workspace contains an invalid ${table}.${column} value`,
+          )
+        }),
+      )
+    }
+  }
+
+  private restoreWorkspace(workspace: WorkspaceSnapshot): void {
+    this.insertRows('metadata', workspace.metadata)
+    this.insertRows('subscriptions', workspace.subscriptions)
+    this.insertRows('recommendations', workspace.recommendations)
+    this.insertRows('coverage', workspace.coverage)
+    this.insertRows('currency_cost_trend', workspace.currencyCostTrend)
+    this.insertRows('cost_trend', workspace.costTrend)
+    this.insertRows('exceptions', workspace.exceptions)
+    this.insertRows('remediation_actions', workspace.remediationActions)
+  }
+
+  private saveActiveAssessment(
+    assessmentId = this.getMetadata('active_assessment_id'),
+  ): void {
+    if (!assessmentId) return
+    const assessment = this.database
+      .prepare('SELECT id FROM assessments WHERE id = ?')
+      .get(assessmentId)
+    if (!assessment) return
+    const latestScan = this.database
+      .prepare(
+        `SELECT * FROM scans
+         WHERE assessment_id = ? AND status = 'completed'
+         ORDER BY started_at DESC
+         LIMIT 1`,
+      )
+      .get(assessmentId) as Row | undefined
+    const workspace = this.captureWorkspace()
+    const now = new Date().toISOString()
+    this.database
+      .prepare(
+        `UPDATE assessments
+         SET updated_at = ?,
+           last_scan_at = COALESCE(?, last_scan_at),
+           workspace_json = ?
+         WHERE id = ?`,
+      )
+      .run(
+        now,
+        latestScan
+          ? asOptionalString(latestScan.completed_at) ??
+              asString(latestScan.started_at)
+          : null,
+        JSON.stringify(workspace),
+        assessmentId,
+      )
+  }
+
+  private migrateLegacyAssessment(): void {
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      if (
+        this.getMetadata('active_assessment_id') ||
+        this.database.prepare('SELECT id FROM assessments LIMIT 1').get()
+      ) {
+        this.database.exec('COMMIT')
+        return
+      }
+      const dataCount = this.database
+        .prepare(
+          `SELECT
+            (SELECT COUNT(*) FROM recommendations) +
+            (SELECT COUNT(*) FROM subscriptions) AS count`,
+        )
+        .get() as Row
+      if (asNumber(dataCount.count) === 0) {
+        this.database.exec('COMMIT')
+        return
+      }
+      const latestScan = this.database
+        .prepare(
+          `SELECT * FROM scans
+           WHERE status = 'completed'
+           ORDER BY started_at DESC
+           LIMIT 1`,
+        )
+        .get() as Row | undefined
+      if (!latestScan) {
+        this.database.exec('COMMIT')
+        return
+      }
+
+      const id = randomUUID()
+      const now = new Date().toISOString()
+      const name =
+        asOptionalString(latestScan.assessment_name) ??
+        this.getMetadata('assessment_name') ??
+        'Imported assessment'
+      const mode = asString(latestScan.mode) as ScanMode
+      const provider = asString(latestScan.provider)
+      const tenantId = asOptionalString(latestScan.tenant_id)
+      const assessmentName = asOptionalString(
+        latestScan.assessment_name,
+      )
+      const selectedSubscriptionIds = parseJson<string[]>(
+        this.getMetadata('subscription_ids') ?? '[]',
+      )
+      const workspace = this.captureWorkspace()
+      this.database
+        .prepare(
+          `INSERT INTO assessments (
+            id, name, mode, status, selected_subscription_ids_json,
+            subscriptions_discovered, recommendations_found, warning_count,
+            created_at, updated_at, last_scan_at, workspace_json
+          ) VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          name,
+          mode,
+          JSON.stringify(selectedSubscriptionIds),
+          asNumber(latestScan.subscriptions_discovered),
+          asNumber(latestScan.recommendations_found),
+          asNumber(latestScan.warning_count),
+          asString(latestScan.started_at),
+          now,
+          asOptionalString(latestScan.completed_at) ??
+            asString(latestScan.started_at),
+          JSON.stringify(workspace),
+        )
+      this.database
+        .prepare(
+          `UPDATE scans
+           SET assessment_id = ?
+           WHERE assessment_id IS NULL
+             AND provider = ?
+             AND mode = ?
+             AND (
+               (? IS NULL AND tenant_id IS NULL)
+               OR tenant_id = ?
+             )
+             AND (
+               (? IS NULL AND assessment_name IS NULL)
+               OR assessment_name = ?
+             )`,
+        )
+        .run(
+          id,
+          provider,
+          mode,
+          tenantId ?? null,
+          tenantId ?? null,
+          assessmentName ?? null,
+          assessmentName ?? null,
+        )
+      this.setMetadata('active_assessment_id', id, now)
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private assessmentFromRow(row: Row): AssessmentSummary {
+    return {
+      id: asString(row.id),
+      name: asString(row.name),
+      mode: asString(row.mode) as ScanMode,
+      status: asString(row.status) as AssessmentSummary['status'],
+      selectedSubscriptionIds: parseJson<string[]>(
+        row.selected_subscription_ids_json,
+      ),
+      subscriptionsDiscovered: asNumber(row.subscriptions_discovered),
+      recommendationsFound: asNumber(row.recommendations_found),
+      warningCount: asNumber(row.warning_count),
+      createdAt: asString(row.created_at),
+      updatedAt: asString(row.updated_at),
+      lastScanAt: asOptionalString(row.last_scan_at),
+    }
+  }
+
+  listAssessments(): AssessmentSummary[] {
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM assessments
+         WHERE mode = 'live'
+         ORDER BY COALESCE(last_scan_at, updated_at) DESC, id`,
+      )
+      .all() as Row[]
+    return rows.map((row) => this.assessmentFromRow(row))
+  }
+
+  hasRunningScan(): boolean {
+    return Boolean(
+      this.database
+        .prepare("SELECT id FROM scans WHERE status = 'running' LIMIT 1")
+        .get(),
+    )
+  }
+
+  getAssessment(id: string): AssessmentSummary | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM assessments WHERE id = ?')
+      .get(id) as Row | undefined
+    return row ? this.assessmentFromRow(row) : undefined
+  }
+
+  getAssessmentScans(id: string, limit?: number): ScanRecord[] {
+    const safeLimit =
+      limit === undefined
+        ? undefined
+        : Math.max(1, Math.min(500, Math.floor(limit)))
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM scans
+         WHERE assessment_id = ?
+         ORDER BY started_at DESC
+         ${safeLimit === undefined ? '' : 'LIMIT ?'}`,
+      )
+      .all(...(safeLimit === undefined ? [id] : [id, safeLimit])) as Row[]
+    return rows.map((row) => this.scanFromRow(row))
+  }
+
+  activateAssessment(id: string): AssessmentSummary | undefined {
+    if (this.hasRunningScan()) {
+      throw new Error(
+        'Assessments cannot be switched while a scan is running',
+      )
+    }
+    const row = this.database
+      .prepare('SELECT * FROM assessments WHERE id = ?')
+      .get(id) as Row | undefined
+    if (!row) return undefined
+    if (
+      asString(row.status) !== 'completed' ||
+      !asOptionalString(row.last_scan_at)
+    ) {
+      throw new Error('Only completed assessments can be opened')
+    }
+    const activeId = this.getMetadata('active_assessment_id')
+    if (activeId === id) return this.assessmentFromRow(row)
+    this.saveActiveAssessment(activeId)
+    const workspace = parseJson<WorkspaceSnapshot>(row.workspace_json)
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      this.clearWorkspace()
+      this.restoreWorkspace(workspace)
+      this.setMetadata(
+        'active_assessment_id',
+        id,
+        new Date().toISOString(),
+      )
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+    return this.assessmentFromRow(row)
+  }
+
+  deleteAssessment(id: string): boolean {
+    if (this.hasRunningScan()) {
+      throw new Error(
+        'Assessments cannot be deleted while a scan is running',
+      )
+    }
+    const existing = this.getAssessment(id)
+    if (!existing) return false
+    const activeId = this.getMetadata('active_assessment_id')
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      if (activeId === id) this.clearWorkspace()
+      this.database
+        .prepare('DELETE FROM scans WHERE assessment_id = ?')
+        .run(id)
+      this.database.prepare('DELETE FROM assessments WHERE id = ?').run(id)
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+    return true
   }
 
   private isEmpty(): boolean {
@@ -340,8 +770,7 @@ export class ProspectorStore {
   private seedDemoData(): void {
     const snapshot = createDemoSnapshot()
     const scan = this.startScan('demo', snapshot.provider)
-    this.upsertCollectedSnapshot(scan.id, snapshot)
-    this.finishScan(scan.id)
+    this.completeScan(scan.id, snapshot)
   }
 
   private setMetadata(key: string, value: string, now: string): void {
@@ -364,6 +793,7 @@ export class ProspectorStore {
 
   private getActiveScope(): ActiveScope {
     const provider = this.getMetadata('provider') ?? 'demo'
+    const assessmentId = this.getMetadata('active_assessment_id')
     const tenantId =
       this.getMetadata('mode') === 'live'
         ? this.getMetadata('tenant_id')
@@ -374,6 +804,7 @@ export class ProspectorStore {
     const assessmentName = this.getMetadata('assessment_name')
     return {
       provider,
+      ...(assessmentId ? { assessmentId } : {}),
       tenantId,
       ...(subscriptionIds.length ? { subscriptionIds } : {}),
       ...(assessmentName ? { assessmentName } : {}),
@@ -396,21 +827,73 @@ export class ProspectorStore {
     provider: string,
     tenantId?: string,
     assessmentName?: string,
+    assessmentId?: string,
+    selectedSubscriptionIds: string[] = [],
   ): ScanRecord {
     const id = randomUUID()
+    const targetAssessmentId = assessmentId ?? randomUUID()
     const startedAt = new Date().toISOString()
+    const existingAssessment = this.database
+      .prepare('SELECT * FROM assessments WHERE id = ?')
+      .get(targetAssessmentId) as Row | undefined
+    if (assessmentId && !existingAssessment) {
+      throw new Error(`Assessment not found: ${assessmentId}`)
+    }
+    if (
+      existingAssessment &&
+      asString(existingAssessment.status) === 'completed' &&
+      this.getMetadata('active_assessment_id') !== targetAssessmentId
+    ) {
+      this.activateAssessment(targetAssessmentId)
+    }
+    if (
+      existingAssessment &&
+      asString(existingAssessment.mode) !== mode
+    ) {
+      throw new Error('Assessment mode cannot be changed')
+    }
+    if (existingAssessment) {
+      this.database
+        .prepare(
+          `UPDATE assessments
+           SET status = 'running', updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          startedAt,
+          targetAssessmentId,
+        )
+    } else {
+      this.database
+        .prepare(
+          `INSERT INTO assessments (
+            id, name, mode, status, selected_subscription_ids_json,
+            created_at, updated_at, workspace_json
+          ) VALUES (?, ?, ?, 'running', ?, ?, ?, '{}')`,
+        )
+        .run(
+          targetAssessmentId,
+          assessmentName ?? 'Sample workspace',
+          mode,
+          JSON.stringify(selectedSubscriptionIds),
+          startedAt,
+          startedAt,
+        )
+    }
     this.database
       .prepare(
         `INSERT INTO scans (
-          id, mode, provider, status, assessment_name, tenant_id, started_at,
-          warnings_json
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, '[]')`,
+          id, assessment_id, mode, provider, status, assessment_name,
+          selected_subscription_ids_json, tenant_id, started_at, warnings_json
+        ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, '[]')`,
       )
       .run(
         id,
+        targetAssessmentId,
         mode,
         provider,
         assessmentName ?? null,
+        JSON.stringify(selectedSubscriptionIds),
         tenantId ?? null,
         startedAt,
       )
@@ -418,7 +901,21 @@ export class ProspectorStore {
   }
 
   finishScan(id: string): ScanRecord {
-    const completedAt = new Date().toISOString()
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const scan = this.finishScanState(id, new Date().toISOString())
+      this.database.exec('COMMIT')
+      return scan
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private finishScanState(
+    id: string,
+    completedAt: string,
+  ): ScanRecord {
     const result = this.database
       .prepare(
         `UPDATE scans
@@ -429,7 +926,40 @@ export class ProspectorStore {
     if (Number(result.changes) === 0) {
       throw new Error(`Running scan not found: ${id}`)
     }
-    return this.getScan(id)
+    const scan = this.getScan(id)
+    if (scan.assessmentId) {
+      const scanMetadata = this.database
+        .prepare(
+          `SELECT assessment_name, selected_subscription_ids_json
+           FROM scans WHERE id = ?`,
+        )
+        .get(id) as Row
+      this.database
+        .prepare(
+          `UPDATE assessments
+           SET name = COALESCE(?, name),
+             status = 'completed',
+             selected_subscription_ids_json = ?,
+             subscriptions_discovered = ?,
+             recommendations_found = ?,
+             warning_count = ?,
+             updated_at = ?,
+             last_scan_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          asOptionalString(scanMetadata.assessment_name) ?? null,
+          asString(scanMetadata.selected_subscription_ids_json),
+          scan.subscriptionsDiscovered,
+          scan.recommendationsFound,
+          scan.warningCount,
+          completedAt,
+          completedAt,
+          scan.assessmentId,
+        )
+      this.saveActiveAssessment(scan.assessmentId)
+    }
+    return scan
   }
 
   failScan(id: string, error: string): ScanRecord {
@@ -444,7 +974,21 @@ export class ProspectorStore {
     if (Number(result.changes) === 0) {
       throw new Error(`Running scan not found: ${id}`)
     }
-    return this.getScan(id)
+    const scan = this.getScan(id)
+    if (scan.assessmentId) {
+      this.database
+        .prepare(
+          `UPDATE assessments
+           SET status = CASE
+               WHEN last_scan_at IS NULL THEN 'failed'
+               ELSE 'completed'
+             END,
+             updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(completedAt, scan.assessmentId)
+    }
+    return scan
   }
 
   private getScan(id: string): ScanRecord {
@@ -465,9 +1009,9 @@ export class ProspectorStore {
         clauses.push('tenant_id = ?')
         params.push(scope.tenantId)
       }
-      if (scope.assessmentName) {
-        clauses.push('assessment_name = ?')
-        params.push(scope.assessmentName)
+      if (scope.assessmentId) {
+        clauses.push('assessment_id = ?')
+        params.push(scope.assessmentId)
       }
     }
     const row = this.database
@@ -492,9 +1036,9 @@ export class ProspectorStore {
         clauses.push('tenant_id = ?')
         params.push(scope.tenantId)
       }
-      if (scope.assessmentName) {
-        clauses.push('assessment_name = ?')
-        params.push(scope.assessmentName)
+      if (scope.assessmentId) {
+        clauses.push('assessment_id = ?')
+        params.push(scope.assessmentId)
       }
     }
     params.push(safeLimit)
@@ -512,6 +1056,7 @@ export class ProspectorStore {
   private scanFromRow(row: Row): ScanRecord {
     return {
       id: asString(row.id),
+      assessmentId: asOptionalString(row.assessment_id),
       mode: asString(row.mode) as ScanRecord['mode'],
       status: asString(row.status) as ScanRecord['status'],
       assessmentName: asOptionalString(row.assessment_name),
@@ -530,15 +1075,24 @@ export class ProspectorStore {
     }
   }
 
-  upsertCollectedSnapshot(scanId: string, snapshot: ProviderSnapshot): void {
+  upsertCollectedSnapshot(
+    scanId: string,
+    snapshot: ProviderSnapshot,
+    finalize = false,
+  ): ScanRecord | undefined {
     const runningScan = this.database
       .prepare(
-        `SELECT id, assessment_name
+        `SELECT id, assessment_id, assessment_name
          FROM scans
          WHERE id = ? AND status = 'running'`,
       )
       .get(scanId) as Row | undefined
     if (!runningScan) throw new Error(`Running scan not found: ${scanId}`)
+    const targetAssessmentId = asString(runningScan.assessment_id)
+    const activeAssessmentId = this.getMetadata('active_assessment_id')
+    if (activeAssessmentId !== targetAssessmentId) {
+      this.saveActiveAssessment(activeAssessmentId)
+    }
     for (const recommendation of snapshot.recommendations) {
       if (
         !Number.isFinite(recommendation.confidence) ||
@@ -554,6 +1108,10 @@ export class ProspectorStore {
     this.database.exec('BEGIN IMMEDIATE')
     try {
       const now = snapshot.collectedAt
+      if (activeAssessmentId !== targetAssessmentId) {
+        this.clearWorkspace()
+      }
+      this.setMetadata('active_assessment_id', targetAssessmentId, now)
       this.setMetadata('mode', snapshot.mode, now)
       this.setMetadata('provider', snapshot.provider, now)
       this.setMetadata('tenant_name', snapshot.tenantName, now)
@@ -800,11 +1358,24 @@ export class ProspectorStore {
           scanId,
         )
 
+      const completedScan = finalize
+        ? this.finishScanState(scanId, new Date().toISOString())
+        : undefined
       this.database.exec('COMMIT')
+      return completedScan
     } catch (error) {
       this.database.exec('ROLLBACK')
       throw error
     }
+  }
+
+  completeScan(
+    scanId: string,
+    snapshot: ProviderSnapshot,
+  ): ScanRecord {
+    const scan = this.upsertCollectedSnapshot(scanId, snapshot, true)
+    if (!scan) throw new Error(`Scan was not completed: ${scanId}`)
+    return scan
   }
 
   private runRecommendationUpsert(
@@ -1433,11 +2004,14 @@ export class ProspectorStore {
         })),
       }
     })
-    const latest = this.latestScan(scope)
+    const latest = scope.assessmentId
+      ? this.latestScan(scope)
+      : undefined
 
     return {
       generatedAt: nowIso,
       estate: {
+        assessmentId: scope.assessmentId,
         assessmentName: latest?.assessmentName,
         tenantName: this.getMetadata('tenant_name') ?? 'Azure Estate',
         mode: this.getMetadata('mode') === 'live' ? 'live' : 'demo',
@@ -1499,7 +2073,9 @@ export class ProspectorStore {
           action: asOptionalString(row.action),
         }),
       ),
-      recentScans: this.recentScans(5, scope),
+      recentScans: scope.assessmentId
+        ? this.recentScans(5, scope)
+        : [],
     }
   }
 }

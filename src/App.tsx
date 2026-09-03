@@ -10,7 +10,6 @@ import {
   Code2,
   Gauge,
   Gem,
-  History,
   LayoutDashboard,
   ListChecks,
   LogIn,
@@ -30,6 +29,8 @@ import {
 } from 'lucide-react'
 
 import { BrandMark } from '@/components/brand-mark'
+import { AssessmentCollection } from '@/components/assessment-collection'
+import { AssessmentExportMenu } from '@/components/assessment-export-menu'
 import { CostTrendChart } from '@/components/cost-trend-chart'
 import { CoveragePanel } from '@/components/coverage-panel'
 import { RecommendationDetail } from '@/components/recommendation-detail'
@@ -44,11 +45,14 @@ import {
   createAction,
   createException,
   clearException,
+  deleteAssessmentWorkspace,
   getActions,
+  getAssessments,
   getAuthStatus,
   getAzureSubscriptions,
   getOverview,
   getRecommendations,
+  openAssessmentWorkspace,
   signInWithBrowser,
   startScan,
   updateActionStatus,
@@ -66,6 +70,7 @@ import {
   recommendationCategories,
   recommendationStatuses,
   type ActionStatus,
+  type AssessmentSummary,
   type AuthStatusResponse,
   type AzureSubscriptionOption,
   type CreateActionRequest,
@@ -99,6 +104,7 @@ function loadDashboardData() {
     getOverview(),
     getRecommendations({ includeExcepted: true }),
     getActions(),
+    getAssessments(),
   ])
 }
 
@@ -157,6 +163,7 @@ function App() {
   const [overview, setOverview] = useState<OverviewResponse>()
   const [recommendations, setRecommendations] = useState<Recommendation[]>([])
   const [actions, setActions] = useState<RemediationAction[]>([])
+  const [assessments, setAssessments] = useState<AssessmentSummary[]>([])
   const [selected, setSelected] = useState<Recommendation>()
   const [activeView, setActiveView] = useState<View>('overview')
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
@@ -175,6 +182,7 @@ function App() {
   >([])
   const [subscriptionSearch, setSubscriptionSearch] = useState('')
   const [assessmentName, setAssessmentName] = useState('')
+  const [editingAssessmentId, setEditingAssessmentId] = useState<string>()
   const [activeAssessment, setActiveAssessment] = useState<{
     name: string
     subscriptionCount: number
@@ -194,11 +202,17 @@ function App() {
   const [includeExcepted, setIncludeExcepted] = useState(false)
 
   async function refresh(selectedId?: string) {
-    const [nextOverview, nextRecommendations, nextActions] =
+    const [
+      nextOverview,
+      nextRecommendations,
+      nextActions,
+      nextAssessments,
+    ] =
       await loadDashboardData()
     setOverview(nextOverview)
     setRecommendations(nextRecommendations)
     setActions(nextActions)
+    setAssessments(nextAssessments)
     if (selectedId) {
       setSelected(nextRecommendations.find((item) => item.id === selectedId))
     }
@@ -209,12 +223,20 @@ function App() {
   useEffect(() => {
     let active = true
     void loadDashboardData()
-      .then(([nextOverview, nextRecommendations, nextActions]) => {
+      .then(
+        ([
+          nextOverview,
+          nextRecommendations,
+          nextActions,
+          nextAssessments,
+        ]) => {
         if (!active) return
         setOverview(nextOverview)
         setRecommendations(nextRecommendations)
         setActions(nextActions)
-      })
+        setAssessments(nextAssessments)
+        },
+      )
       .catch((requestError: unknown) => {
         if (active) setError(messageFromError(requestError))
       })
@@ -326,7 +348,7 @@ function App() {
     }
   }
 
-  async function openAssessment() {
+  async function openAssessment(assessment?: AssessmentSummary) {
     setNotice(undefined)
     setError(undefined)
     if (!(await connectAzure(false))) return
@@ -334,11 +356,27 @@ function App() {
     try {
       const subscriptions = await getAzureSubscriptions()
       setSubscriptionOptions(subscriptions)
-      setSelectedSubscriptionIds([])
+      setSelectedSubscriptionIds(
+        assessment?.selectedSubscriptionIds ?? [],
+      )
       setSubscriptionSearch('')
-      setAssessmentName('')
+      setAssessmentName(assessment?.name ?? '')
+      setEditingAssessmentId(assessment?.id)
       setSubscriptionPickerOpen(true)
     } catch (subscriptionError) {
+      setError(messageFromError(subscriptionError))
+    } finally {
+      setLoadingSubscriptions(false)
+    }
+  }
+
+  async function refreshSubscriptionSessions() {
+    setLoadingSubscriptions(true)
+    try {
+      const subscriptions = await getAzureSubscriptions()
+      setSubscriptionOptions(subscriptions)
+    } catch (subscriptionError) {
+      setSubscriptionPickerOpen(false)
       setError(messageFromError(subscriptionError))
     } finally {
       setLoadingSubscriptions(false)
@@ -356,6 +394,7 @@ function App() {
     try {
       const scan = await startScan({
         mode: 'live',
+        assessmentId: editingAssessmentId,
         assessmentName: normalizedName,
         subscriptionIds,
       })
@@ -382,6 +421,7 @@ function App() {
     } finally {
       setScanning(undefined)
       setActiveAssessment(undefined)
+      setEditingAssessmentId(undefined)
     }
   }
 
@@ -436,8 +476,47 @@ function App() {
     setIncludeExcepted(false)
   }
 
-  function openPreviousResults() {
-    setWorkspaceOpen(true)
+  async function openSavedAssessment(assessment: AssessmentSummary) {
+    setLoading(true)
+    setNotice(undefined)
+    setError(undefined)
+    try {
+      await openAssessmentWorkspace(assessment.id)
+      await refresh()
+      setWorkspaceOpen(true)
+      resetWorkspaceView()
+    } catch (assessmentError) {
+      setError(messageFromError(assessmentError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function deleteSavedAssessment(assessment: AssessmentSummary) {
+    const confirmed = window.confirm(
+      `Delete "${assessment.name}" and its saved results? This cannot be undone.`,
+    )
+    if (!confirmed) return
+    setLoading(true)
+    setNotice(undefined)
+    setError(undefined)
+    try {
+      await deleteAssessmentWorkspace(assessment.id)
+      if (overview?.estate.assessmentId === assessment.id) {
+        setWorkspaceOpen(false)
+      }
+      await refresh()
+      setNotice(`Deleted ${assessment.name}.`)
+    } catch (assessmentError) {
+      setError(messageFromError(assessmentError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function goHome() {
+    setWorkspaceOpen(false)
+    setSubscriptionPickerOpen(false)
     resetWorkspaceView()
     setNotice(undefined)
     setError(undefined)
@@ -512,7 +591,14 @@ function App() {
     <div className="min-h-screen bg-background text-foreground">
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r bg-card px-4 py-5 lg:flex">
         <div className="px-2">
-          <BrandMark />
+          <button
+            type="button"
+            className="rounded-[0.625rem] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="Return to Azure Prospector home"
+            onClick={goHome}
+          >
+            <BrandMark />
+          </button>
         </div>
 
         {hasAssessment && overview && (
@@ -565,7 +651,7 @@ function App() {
             </a>
           </div>
           <div className="px-2 text-[11px] leading-5 text-muted-foreground">
-            Community project. Not an official Microsoft product.
+            Not an official Microsoft product.
           </div>
         </div>
       </aside>
@@ -574,7 +660,14 @@ function App() {
         <header className="sticky top-0 z-20 border-b bg-[var(--cp-panel-strong)]">
           <div className="flex min-h-16 items-center gap-3 px-4 sm:px-6 lg:px-8">
             <div className="lg:hidden">
-              <BrandMark compact />
+              <button
+                type="button"
+                className="rounded-[0.625rem] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label="Return to Azure Prospector home"
+                onClick={goHome}
+              >
+                <BrandMark compact />
+              </button>
             </div>
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-bold text-foreground">
@@ -614,6 +707,7 @@ function App() {
             ) : (
               <Button
                 disabled={connecting || loadingSubscriptions}
+                aria-label="Connect Azure"
                 title={authentication?.message}
                 onClick={() => void connectAzure()}
               >
@@ -637,9 +731,19 @@ function App() {
                 <Moon className="size-4" aria-hidden="true" />
               )}
             </Button>
+            {hasAssessment && overview?.estate.assessmentId && (
+              <AssessmentExportMenu
+                assessmentId={overview.estate.assessmentId}
+              />
+            )}
             {hasAssessment && (
               <Button
                 disabled={Boolean(scanning) || loadingSubscriptions}
+                aria-label={
+                  overview?.estate.mode === 'demo'
+                    ? 'Start live assessment'
+                    : 'New assessment'
+                }
                 onClick={() => void openAssessment()}
               >
                 {scanning === 'live' || loadingSubscriptions ? (
@@ -728,22 +832,21 @@ function App() {
               authentication={authentication}
               connecting={connecting || loadingSubscriptions}
               scanning={scanning}
-              previousAssessment={
-                hasStoredAssessment
-                  ? {
-                      name:
-                        overview.estate.assessmentName ??
-                        overview.estate.tenantName,
-                      mode: overview.estate.mode,
-                      subscriptions: overview.estate.subscriptions,
-                      lastScanAt: overview.estate.lastScanAt!,
-                    }
-                  : undefined
-              }
+              assessments={assessments.filter(
+                (assessment) => assessment.mode === 'live',
+              )}
               onConnect={() => void connectAzure()}
               onLiveScan={() => void openAssessment()}
               onDemo={() => void runDemo()}
-              onOpenPrevious={openPreviousResults}
+              onOpenAssessment={(assessment) =>
+                void openSavedAssessment(assessment)
+              }
+              onRescanAssessment={(assessment) =>
+                void openAssessment(assessment)
+              }
+              onDeleteAssessment={(assessment) =>
+                void deleteSavedAssessment(assessment)
+              }
             />
           ) : (
             <>
@@ -803,11 +906,14 @@ function App() {
         selectedIds={selectedSubscriptionIds}
         search={subscriptionSearch}
         assessmentName={assessmentName}
+        editing={Boolean(editingAssessmentId)}
         busy={Boolean(scanning)}
+        refreshing={loadingSubscriptions}
         onOpenChange={setSubscriptionPickerOpen}
         onSelectedIdsChange={setSelectedSubscriptionIds}
         onSearchChange={setSubscriptionSearch}
         onAssessmentNameChange={setAssessmentName}
+        onRefresh={() => void refreshSubscriptionSessions()}
         onSubmit={() =>
           void runScan(assessmentName, selectedSubscriptionIds)
         }
@@ -980,25 +1086,24 @@ function WelcomeView({
   authentication,
   connecting,
   scanning,
-  previousAssessment,
+  assessments,
   onConnect,
   onLiveScan,
   onDemo,
-  onOpenPrevious,
+  onOpenAssessment,
+  onRescanAssessment,
+  onDeleteAssessment,
 }: {
   authentication?: AuthStatusResponse
   connecting: boolean
   scanning?: ScanMode
-  previousAssessment?: {
-    name: string
-    mode: ScanMode
-    subscriptions: number
-    lastScanAt: string
-  }
+  assessments: AssessmentSummary[]
   onConnect: () => void
   onLiveScan: () => void
   onDemo: () => void
-  onOpenPrevious: () => void
+  onOpenAssessment: (assessment: AssessmentSummary) => void
+  onRescanAssessment: (assessment: AssessmentSummary) => void
+  onDeleteAssessment: (assessment: AssessmentSummary) => void
 }) {
   const connected = authentication?.authenticated
   return (
@@ -1092,31 +1197,13 @@ function WelcomeView({
           </Card>
         </div>
 
-        {previousAssessment && (
-          <div className="mx-auto mt-5 flex max-w-3xl flex-wrap items-center justify-between gap-4 rounded-xl border bg-card px-5 py-4">
-            <div className="flex min-w-0 items-center gap-3">
-              <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-secondary text-primary">
-                <History className="size-4" aria-hidden="true" />
-              </span>
-              <div className="min-w-0">
-                <div className="truncate text-sm font-bold text-foreground">
-                  {previousAssessment.name}
-                </div>
-                <div className="mt-0.5 text-xs text-muted-foreground">
-                  {previousAssessment.mode === 'demo' ? 'Sample' : 'Live'} ·{' '}
-                  {previousAssessment.subscriptions}{' '}
-                  {previousAssessment.subscriptions === 1
-                    ? 'subscription'
-                    : 'subscriptions'}{' '}
-                  · {formatDate(previousAssessment.lastScanAt, true)}
-                </div>
-              </div>
-            </div>
-            <Button variant="ghost" size="sm" onClick={onOpenPrevious}>
-              Open previous results
-            </Button>
-          </div>
-        )}
+        <AssessmentCollection
+          assessments={assessments}
+          busy={connecting || Boolean(scanning)}
+          onOpen={onOpenAssessment}
+          onRescan={onRescanAssessment}
+          onDelete={onDeleteAssessment}
+        />
       </div>
     </div>
   )

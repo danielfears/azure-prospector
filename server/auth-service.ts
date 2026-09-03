@@ -29,6 +29,7 @@ type AuthenticationMode =
   | 'browser'
   | 'managed_identity'
   | 'default_credential'
+type AzureCliCommand = (arguments_: string[]) => Promise<string>
 
 export interface InteractiveTokenCredential extends TokenCredential {
   authenticate(
@@ -45,6 +46,7 @@ export interface AzureAuthenticationServiceOptions {
   cliCredential?: TokenCredential
   browserCredential?: InteractiveTokenCredential
   hostedCredential?: TokenCredential
+  azureCliCommand?: AzureCliCommand
 }
 
 export class AzureAuthenticationRequiredError extends Error {
@@ -134,6 +136,7 @@ function subscriptionOption(value: unknown): AzureSubscriptionOption | undefined
         : row.tenantId,
     state: row.state,
     isDefault: row.isDefault === true,
+    authenticationStatus: 'ready',
   }
 }
 
@@ -143,6 +146,7 @@ export class AzureAuthenticationService implements TokenCredential {
   private readonly cliCredential: TokenCredential
   private readonly browserCredential: InteractiveTokenCredential
   private readonly hostedCredential?: TokenCredential
+  private readonly azureCliCommand: AzureCliCommand
   private cachedToken?: {
     source: AuthenticationSource
     scopes: string
@@ -158,6 +162,16 @@ export class AzureAuthenticationService implements TokenCredential {
     this.cliCredential =
       options.cliCredential ??
       new AzureCliCredential({ tenantId: this.tenantId })
+    this.azureCliCommand =
+      options.azureCliCommand ??
+      (async (arguments_) => {
+        const { stdout } = await execFileAsync('az', arguments_, {
+          timeout: 30_000,
+          maxBuffer: 10 * 1024 * 1024,
+          windowsHide: true,
+        })
+        return stdout
+      })
     const browserClientId =
       options.browserClientId ??
       process.env.PROSPECTOR_BROWSER_CLIENT_ID?.trim() ??
@@ -357,14 +371,8 @@ export class AzureAuthenticationService implements TokenCredential {
   }
 
   private async cliSubscriptions(): Promise<AzureSubscriptionOption[]> {
-    const { stdout } = await execFileAsync(
-      'az',
+    const stdout = await this.azureCliCommand(
       ['account', 'list', '--all', '--output', 'json', '--only-show-errors'],
-      {
-        timeout: 30_000,
-        maxBuffer: 10 * 1024 * 1024,
-        windowsHide: true,
-      },
     )
     const parsed = JSON.parse(stdout) as unknown
     if (!Array.isArray(parsed)) {
@@ -376,6 +384,41 @@ export class AzureAuthenticationService implements TokenCredential {
         (subscription): subscription is AzureSubscriptionOption =>
           subscription !== undefined,
       )
+  }
+
+  private async checkCliTenantSessions(
+    subscriptions: AzureSubscriptionOption[],
+  ): Promise<AzureSubscriptionOption[]> {
+    const tenantIds = [
+      ...new Set(subscriptions.map((subscription) => subscription.tenantId)),
+    ]
+    const statuses = new Map(
+      await Promise.all(
+        tenantIds.map(async (tenantId) => {
+          try {
+            await this.azureCliCommand([
+              'account',
+              'get-access-token',
+              '--tenant',
+              tenantId,
+              '--resource',
+              'https://management.azure.com',
+              '--output',
+              'none',
+              '--only-show-errors',
+            ])
+            return [tenantId, 'ready'] as const
+          } catch {
+            return [tenantId, 'refresh_required'] as const
+          }
+        }),
+      ),
+    )
+    return subscriptions.map((subscription) => ({
+      ...subscription,
+      authenticationStatus:
+        statuses.get(subscription.tenantId) ?? 'refresh_required',
+    }))
   }
 
   private async armSubscriptions(): Promise<AzureSubscriptionOption[]> {
@@ -414,10 +457,14 @@ export class AzureAuthenticationService implements TokenCredential {
   async listSubscriptions(): Promise<AzureSubscriptionOption[]> {
     await this.ensureAuthenticated()
     const allowList = configuredSubscriptionIds()
-    const subscriptions =
+    const discoveredSubscriptions =
       this.activeSource === 'azure_cli'
         ? await this.cliSubscriptions()
         : await this.armSubscriptions()
+    const subscriptions =
+      this.activeSource === 'azure_cli'
+        ? await this.checkCliTenantSessions(discoveredSubscriptions)
+        : discoveredSubscriptions
     return subscriptions
       .filter(
         (subscription) =>

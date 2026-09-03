@@ -31,6 +31,8 @@ Azure Prospector does not attempt to replace those systems. It provides a persis
 - Read-only live Azure collector using `@azure/identity`
 - CLI-first authentication with optional browser fallback
 - Named, searchable multi-subscription cost assessments
+- Saved assessment collection with open, rescan, and confirmed delete actions
+- Complete JSON report and findings CSV exports
 - Visible-subscription discovery
 - Azure Advisor cost recommendation ingestion
 - Azure Resource Graph orphan-resource checks
@@ -59,8 +61,8 @@ npm run app
 `npm run app` starts Prospector and opens `http://localhost:4310`. It opens on a
 live-first connection screen; sample data is loaded only through the explicit
 **Explore demo** action. Previous assessment data remains stored locally but is
-shown only after choosing **Open previous results**. Local data is written to
-`data\azure-prospector.db`.
+shown only after opening it from **Saved assessments**. Local data is written
+to `data\azure-prospector.db`.
 
 Docker is also supported:
 
@@ -82,11 +84,24 @@ az login --use-device-code --allow-no-subscriptions
 npm run app
 ```
 
-Choose **Run live scan**, name the assessment, search for the project or
+Choose **Choose subscriptions**, name the assessment, search for the project or
 subscription name, and tick the subscriptions to include. Selections can span
 tenants available to the current Azure CLI account; Prospector scans each
-tenant scope with the appropriate credential and combines the results. If the
-CLI session expires, sign in again and use **Connect Azure** to recheck it.
+tenant scope with the appropriate credential and combines the results.
+
+Azure CLI can retain cached subscription names after a tenant refresh token has
+expired. Prospector therefore requests one management token per cached tenant
+when the picker opens. Stale tenants remain visible for diagnosis, but their
+subscriptions are disabled and accompanied by an exact tenant-specific
+`az login` command. After refreshing the CLI session, choose **Recheck
+sessions** without leaving the picker.
+
+Each successful live scan is saved as a named workspace. Home lists the
+collection so assessments can be reopened, rescanned with their saved scope, or
+deleted after confirmation. An opened assessment can be exported as a complete,
+schema-versioned JSON report or an RFC 4180 findings CSV. Exported amounts retain
+their native currencies, resource tag values are redacted, and sensitive
+credential-shaped fields are removed.
 
 Browser sign-in uses Azure Identity's supported
 `InteractiveBrowserCredential`, including its PKCE and loopback handling.
@@ -103,7 +118,7 @@ client secret.
 The default `auto` mode is deliberately local-user friendly:
 
 1. Use a valid Azure CLI session without prompting.
-2. Fall back to browser sign-in when a browser client ID is configured.
+2. Fall back to explicit Azure Identity browser sign-in when needed.
 3. Show an actionable connection message when neither method is ready.
 
 Set `PROSPECTOR_AUTH_MODE` explicitly for unattended deployments that must use
@@ -227,6 +242,10 @@ npm run check
 |---|---|---|
 | `GET` | `/api/health` | Process, mode, and database health |
 | `GET` | `/api/overview` | Estate KPIs, trends, coverage, and scan history |
+| `GET` | `/api/assessments` | List saved live assessment workspaces |
+| `POST` | `/api/assessments/:id` | Open a saved assessment workspace |
+| `DELETE` | `/api/assessments/:id` | Delete a saved assessment and its run history |
+| `GET` | `/api/assessments/:id/export` | Export active assessment JSON or findings CSV |
 | `GET` | `/api/recommendations` | Filterable recommendation inventory |
 | `GET` | `/api/recommendations/:id` | Recommendation detail and evidence |
 | `POST` | `/api/scans` | Run a demo or live read-only scan |

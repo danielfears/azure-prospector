@@ -176,4 +176,53 @@ describe('AzureAuthenticationService', () => {
       'outside the configured Azure tenant',
     )
   })
+
+  it('flags cached CLI tenants whose management token needs refreshing', async () => {
+    const azureCliCommand = vi.fn(async (arguments_: string[]) => {
+      if (arguments_[0] === 'account' && arguments_[1] === 'list') {
+        return JSON.stringify([
+          {
+            id: 'sub-one',
+            name: 'Ready subscription',
+            tenantId: 'tenant-one',
+            tenantDisplayName: 'Ready tenant',
+            state: 'Enabled',
+            isDefault: true,
+          },
+          {
+            id: 'sub-two',
+            name: 'Stale subscription',
+            tenantId: 'tenant-two',
+            tenantDisplayName: 'Stale tenant',
+            state: 'Enabled',
+            isDefault: false,
+          },
+        ])
+      }
+      const tenantIndex = arguments_.indexOf('--tenant')
+      if (arguments_[tenantIndex + 1] === 'tenant-one') return ''
+      throw new Error('Refresh token expired')
+    })
+    const service = new AzureAuthenticationService({
+      mode: 'azure-cli',
+      cliCredential: {
+        async getToken() {
+          return accessToken
+        },
+      },
+      browserCredential: new StubBrokerCredential(true),
+      azureCliCommand,
+    })
+
+    await expect(service.listSubscriptions()).resolves.toMatchObject([
+      {
+        id: 'sub-one',
+        authenticationStatus: 'ready',
+      },
+      {
+        id: 'sub-two',
+        authenticationStatus: 'refresh_required',
+      },
+    ])
+  })
 })

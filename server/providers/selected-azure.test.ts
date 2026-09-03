@@ -17,6 +17,7 @@ function subscription(
     tenantName: `Tenant ${tenantId}`,
     state: 'Enabled',
     isDefault: false,
+    authenticationStatus: 'ready',
   }
 }
 

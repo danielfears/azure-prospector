@@ -2,6 +2,7 @@ import type {
   CreateActionRequest,
   CreateExceptionRequest,
   ActionStatus,
+  AssessmentSummary,
   AuthStatusResponse,
   AzureSubscriptionOption,
   OverviewResponse,
@@ -51,6 +52,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function getOverview() {
   return request<OverviewResponse>('/api/overview')
+}
+
+export function getAssessments() {
+  return request<AssessmentSummary[]>('/api/assessments')
+}
+
+export function openAssessmentWorkspace(assessmentId: string) {
+  return request<AssessmentSummary>(
+    `/api/assessments/${encodeURIComponent(assessmentId)}`,
+    { method: 'POST' },
+  )
+}
+
+export function deleteAssessmentWorkspace(assessmentId: string) {
+  return request<void>(
+    `/api/assessments/${encodeURIComponent(assessmentId)}`,
+    { method: 'DELETE' },
+  )
 }
 
 export function getAuthStatus() {

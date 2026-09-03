@@ -96,6 +96,52 @@ describe('ProspectorStore', () => {
     }
   })
 
+  it('associates the complete matching legacy scan history', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'prospector-history-'))
+    const databasePath = path.join(directory, 'legacy.db')
+    const initialStore = new ProspectorStore(databasePath, { seed: false })
+    const snapshot = liveSnapshot('tenant-a', 'a')
+    const first = initialStore.startScan(
+      'live',
+      'azure',
+      'tenant-a',
+      'Legacy assessment',
+      undefined,
+      ['subscription-a'],
+    )
+    initialStore.upsertCollectedSnapshot(first.id, snapshot)
+    initialStore.finishScan(first.id)
+    const second = initialStore.startScan(
+      'live',
+      'azure',
+      'tenant-a',
+      'Legacy assessment',
+      first.assessmentId,
+      ['subscription-a'],
+    )
+    initialStore.upsertCollectedSnapshot(second.id, snapshot)
+    initialStore.finishScan(second.id)
+    initialStore.close()
+
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec(`
+      DELETE FROM assessments;
+      UPDATE scans SET assessment_id = NULL;
+      DELETE FROM metadata WHERE key = 'active_assessment_id';
+    `)
+    legacy.close()
+
+    const migrated = new ProspectorStore(databasePath, { seed: false })
+    try {
+      const assessments = migrated.listAssessments()
+      expect(assessments).toHaveLength(1)
+      expect(migrated.getAssessmentScans(assessments[0]!.id)).toHaveLength(2)
+    } finally {
+      migrated.close()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it('rejects non-canonical recommendation confidence values', () => {
     const store = new ProspectorStore(':memory:', { seed: false })
     try {
@@ -471,6 +517,7 @@ describe('ProspectorStore', () => {
         'azure',
         'tenant-a',
         'Tenant A assessment',
+        firstA.assessmentId,
       )
       store.upsertCollectedSnapshot(secondA.id, tenantA)
       store.finishScan(secondA.id)
@@ -515,7 +562,13 @@ describe('ProspectorStore', () => {
 
       const partial = liveSnapshot('tenant-a', 'a')
       partial.recommendations = []
-      const partialScan = store.startScan('live', 'azure', 'tenant-a')
+      const partialScan = store.startScan(
+        'live',
+        'azure',
+        'tenant-a',
+        undefined,
+        fullScan.assessmentId,
+      )
       store.upsertCollectedSnapshot(partialScan.id, partial)
       store.finishScan(partialScan.id)
 
@@ -532,7 +585,13 @@ describe('ProspectorStore', () => {
       excludedScope.recommendations = []
       excludedScope.completeSourceFamilies = []
       excludedScope.completeSourceFamiliesBySubscription = {}
-      const excludedScan = store.startScan('live', 'azure', 'tenant-a')
+      const excludedScan = store.startScan(
+        'live',
+        'azure',
+        'tenant-a',
+        undefined,
+        fullScan.assessmentId,
+      )
       store.upsertCollectedSnapshot(excludedScan.id, excludedScope)
       store.finishScan(excludedScan.id)
       expect(
@@ -581,7 +640,13 @@ describe('ProspectorStore', () => {
           'subscription-b': [],
         },
       }
-      const second = store.startScan('live', 'azure', 'tenant-a')
+      const second = store.startScan(
+        'live',
+        'azure',
+        'tenant-a',
+        undefined,
+        first.assessmentId,
+      )
       store.upsertCollectedSnapshot(second.id, partial)
       store.finishScan(second.id)
 
@@ -598,6 +663,131 @@ describe('ProspectorStore', () => {
           (item) => item.subscriptionId === 'subscription-b',
         )?.status,
       ).toBe('open')
+    } finally {
+      store.close()
+    }
+  })
+
+  it('persists, switches, rescans, and deletes named assessments', () => {
+    const store = new ProspectorStore(':memory:', { seed: false })
+    try {
+      const snapshotA = liveSnapshot('tenant-a', 'a')
+      const scanA = store.startScan(
+        'live',
+        'azure',
+        'tenant-a',
+        'Assessment A',
+        undefined,
+        ['subscription-a'],
+      )
+      store.upsertCollectedSnapshot(scanA.id, snapshotA)
+      store.finishScan(scanA.id)
+      const recommendationA = store.listRecommendations()[0]!
+      store.createAction(recommendationA.id, {
+        actionType: 'manual',
+        title: 'Preserved action',
+        requestedBy: 'operator@example.invalid',
+      })
+
+      const snapshotB = liveSnapshot('tenant-b', 'b')
+      const scanB = store.startScan(
+        'live',
+        'azure',
+        'tenant-b',
+        'Assessment B',
+        undefined,
+        ['subscription-b'],
+      )
+      store.upsertCollectedSnapshot(scanB.id, snapshotB)
+      store.finishScan(scanB.id)
+
+      expect(store.listAssessments().map((item) => item.name)).toEqual([
+        'Assessment B',
+        'Assessment A',
+      ])
+      expect(store.getOverview().estate.assessmentName).toBe('Assessment B')
+
+      store.activateAssessment(scanA.assessmentId!)
+      expect(store.getOverview().estate.assessmentName).toBe('Assessment A')
+      expect(store.listRecommendations()[0]?.id).toBe(recommendationA.id)
+      expect(store.listActions()).toHaveLength(1)
+
+      const rescanA = store.startScan(
+        'live',
+        'azure',
+        'tenant-a',
+        'Assessment A',
+        scanA.assessmentId,
+        ['subscription-a'],
+      )
+      store.upsertCollectedSnapshot(rescanA.id, snapshotA)
+      store.finishScan(rescanA.id)
+      expect(
+        store
+          .recentScans(10)
+          .filter((scan) => scan.assessmentId === scanA.assessmentId),
+      ).toHaveLength(2)
+      expect(store.listActions()).toHaveLength(1)
+
+      expect(store.deleteAssessment(scanB.assessmentId!)).toBe(true)
+      expect(store.listAssessments().map((item) => item.name)).toEqual([
+        'Assessment A',
+      ])
+      expect(store.deleteAssessment(scanA.assessmentId!)).toBe(true)
+      expect(store.listAssessments()).toHaveLength(0)
+      expect(store.listRecommendations()).toHaveLength(0)
+      expect(store.getOverview().estate.lastScanAt).toBeUndefined()
+    } finally {
+      store.close()
+    }
+  })
+
+  it('keeps completed metadata after a failed rescan and blocks switching while running', () => {
+    const store = new ProspectorStore(':memory:', { seed: false })
+    try {
+      const assessmentA = liveSnapshot('tenant-a', 'a')
+      const first = store.startScan(
+        'live',
+        'azure',
+        'tenant-a',
+        'Original assessment',
+        undefined,
+        ['subscription-a'],
+      )
+      store.completeScan(first.id, assessmentA)
+
+      const assessmentB = liveSnapshot('tenant-b', 'b')
+      const second = store.startScan(
+        'live',
+        'azure',
+        'tenant-b',
+        'Other assessment',
+        undefined,
+        ['subscription-b'],
+      )
+      store.completeScan(second.id, assessmentB)
+
+      const rescan = store.startScan(
+        'live',
+        'azure',
+        'tenant-b',
+        'Uncommitted rename',
+        second.assessmentId,
+        ['different-subscription'],
+      )
+      expect(() => store.activateAssessment(first.assessmentId!)).toThrow(
+        'cannot be switched while a scan is running',
+      )
+      store.failScan(rescan.id, 'Expected test failure')
+
+      expect(store.getAssessment(second.assessmentId!)).toMatchObject({
+        name: 'Other assessment',
+        status: 'completed',
+        selectedSubscriptionIds: ['subscription-b'],
+      })
+      expect(store.getOverview().estate.assessmentName).toBe(
+        'Other assessment',
+      )
     } finally {
       store.close()
     }

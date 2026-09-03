@@ -36,6 +36,20 @@ are grouped by tenant for collection. Results are merged only where units and
 currencies are compatible; the active assessment scope prevents findings from
 other projects leaking into the current view.
 
+The active normalized tables remain optimized for dashboard queries. Completed
+assessment workspaces are transactionally serialized into the same SQLite
+database with their scope and run metadata. Opening a workspace snapshots the
+current one before restoring the selected report; rescans update that named
+workspace, while confirmed deletion removes only its snapshot and scan history.
+Legacy single-workspace databases are migrated automatically.
+
+Exports are generated only for the explicitly opened assessment. JSON exports
+carry a versioned schema and the complete dashboard, finding, action, and scan
+data. CSV exports contain normalized findings, use RFC 4180 quoting, protect
+spreadsheet formula cells, and retain source currencies without conversion.
+Tag names are retained for governance context, but tag values are always
+redacted because Azure permits arbitrary secrets to be stored in tags.
+
 Later collectors can add reservation and savings-plan detail, Azure Monitor metrics, Blob Inventory, Storage Discovery exports, AKS allocation, SQL-specific telemetry, and custom policy results without changing the UI contract.
 
 For large production estates, scheduled Cost Management exports are the
