@@ -40,6 +40,10 @@ export function CostTrendChart({ points, currency }: CostTrendChartProps) {
     notation: 'compact',
     maximumFractionDigits: 1,
   })
+  const latestPoint = points.at(-1)
+  const latestScenarioReduction = latestPoint
+    ? Math.max(0, latestPoint.actualCost - latestPoint.optimizedCost)
+    : 0
 
   return (
     <div>
@@ -49,7 +53,9 @@ export function CostTrendChart({ points, currency }: CostTrendChartProps) {
             {currency} cost trajectory
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Actual run rate against the optimized path.
+            Historical spend with today's confidence-weighted,
+            per-resource-deduplicated opportunity applied. Illustrative, not a
+            forecast.
           </p>
         </div>
         <div className="flex items-center gap-4 text-xs text-muted-foreground">
@@ -59,8 +65,13 @@ export function CostTrendChart({ points, currency }: CostTrendChartProps) {
           </span>
           <span className="flex items-center gap-2">
             <span className="size-2 rounded-full bg-success" />
-            Optimized
+            Opportunity scenario
           </span>
+          {latestScenarioReduction > 0 && (
+            <span className="font-semibold text-success">
+              {format.format(latestScenarioReduction)}/month lower
+            </span>
+          )}
         </div>
       </div>
 

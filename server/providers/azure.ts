@@ -20,6 +20,7 @@ import type {
   SnapshotSubscription,
 } from './types.js'
 import { configuredSubscriptionIds } from '../azure-config.js'
+import { calculateOpportunityReductionRatios } from '../opportunity-scenario.js'
 
 const ARM_ORIGIN = 'https://management.azure.com'
 const ARM_SCOPE = 'https://management.azure.com/.default'
@@ -1521,6 +1522,10 @@ export class AzureProvider implements ProspectorProvider {
       }
       monthlyTotalsByCurrency.set(currency, monthlyTotals)
     }
+    const opportunityRatios = calculateOpportunityReductionRatios(
+      recommendations,
+      snapshotSubscriptions,
+    )
     const currencyCostTrends = [...monthlyTotalsByCurrency.entries()]
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([currency, monthlyTotals]) => ({
@@ -1530,7 +1535,9 @@ export class AzureProvider implements ProspectorProvider {
           .map(([period, actualCost]) => ({
             period,
             actualCost,
-            optimizedCost: actualCost,
+            optimizedCost:
+              actualCost *
+              (1 - (opportunityRatios.get(currency) ?? 0)),
             realizedSavings: 0,
           })),
       }))

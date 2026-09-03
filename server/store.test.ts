@@ -86,7 +86,7 @@ describe('ProspectorStore', () => {
         {
           period: '2026-08',
           actualCost: 100,
-          optimizedCost: 90,
+          optimizedCost: 100,
           realizedSavings: 10,
         },
       ])
@@ -188,6 +188,11 @@ describe('ProspectorStore', () => {
       })
       expect(overview.coverage).toHaveLength(4)
       expect(overview.recentScans).toHaveLength(1)
+      expect(
+        overview.savings.byCurrency[0]?.costTrend.every(
+          (point) => point.optimizedCost < point.actualCost,
+        ),
+      ).toBe(true)
     } finally {
       store.close()
     }

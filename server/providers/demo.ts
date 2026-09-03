@@ -472,7 +472,7 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
     return {
       period: monthKey(date),
       actualCost,
-      optimizedCost: actualCost - realizedSavings,
+      optimizedCost: actualCost * 0.92,
       realizedSavings,
     }
   })

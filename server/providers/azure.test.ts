@@ -1,6 +1,10 @@
 import type { TokenCredential } from '@azure/identity'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AzureProvider, createCostQueryPlan } from './azure.js'
+import {
+  AzureProvider,
+  createCostQueryPlan,
+} from './azure.js'
+import { calculateOpportunityReductionRatios } from '../opportunity-scenario.js'
 
 const originalFetch = globalThis.fetch
 const originalSubscriptionIds = process.env.PROSPECTOR_SUBSCRIPTION_IDS
@@ -54,6 +58,43 @@ function jsonResponse(
 }
 
 describe('AzureProvider', () => {
+  it('builds a confidence-weighted, per-resource opportunity scenario', () => {
+    const ratios = calculateOpportunityReductionRatios(
+      [
+        {
+          currency: 'GBP',
+          resourceId: 'resource-one',
+          fingerprint: 'finding-one',
+          estimatedMonthlySavings: 200,
+          currentMonthlyCost: 300,
+          confidence: 0.8,
+        },
+        {
+          currency: 'GBP',
+          resourceId: 'resource-one',
+          fingerprint: 'finding-two',
+          estimatedMonthlySavings: 100,
+          currentMonthlyCost: 300,
+          confidence: 0.9,
+        },
+        {
+          currency: 'USD',
+          fingerprint: 'advisor-only',
+          estimatedMonthlySavings: 500,
+          currentMonthlyCost: 0,
+          confidence: 0.8,
+        },
+      ],
+      [
+        { currency: 'GBP', monthlyCost: 1000 },
+        { currency: 'USD', monthlyCost: 0 },
+      ],
+    )
+
+    expect(ratios.get('GBP')).toBeCloseTo(0.16)
+    expect(ratios.get('USD')).toBe(0)
+  })
+
   it('adapts cost history to the tenant QPU budget', () => {
     expect(createCostQueryPlan(2)).toEqual({
       historyMonths: 6,

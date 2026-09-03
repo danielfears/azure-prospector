@@ -17,6 +17,7 @@ import {
   type SubscriptionSummary,
 } from '../src/shared/types.js'
 import { createDemoSnapshot } from './providers/demo.js'
+import { calculateOpportunityReductionRatios } from './opportunity-scenario.js'
 import type {
   ProviderSnapshot,
   SnapshotRecommendation,
@@ -1967,6 +1968,18 @@ export class ProspectorStore {
         ].filter(Boolean),
       ),
     ].sort()
+    const opportunityRatios = calculateOpportunityReductionRatios(
+      this.listRecommendations()
+        .filter((recommendation) =>
+          ['open', 'accepted', 'in_progress'].includes(
+            recommendation.status,
+          ),
+        ),
+      subscriptionRows.map((row) => ({
+        currency: asString(row.currency),
+        monthlyCost: asNumber(row.monthly_cost),
+      })),
+    )
     const currencySummaries = billingCurrencies.map((currencyCode) => {
       const currencyTrendRows = trendRows.filter(
         (row) => asString(row.currency) === currencyCode,
@@ -1999,7 +2012,9 @@ export class ProspectorStore {
         costTrend: currencyTrendRows.map((row) => ({
           period: asString(row.period),
           actualCost: asNumber(row.actual_cost),
-          optimizedCost: asNumber(row.optimized_cost),
+          optimizedCost:
+            asNumber(row.actual_cost) *
+            (1 - (opportunityRatios.get(currencyCode) ?? 0)),
           realizedSavings: asNumber(row.realized_savings),
         })),
       }
