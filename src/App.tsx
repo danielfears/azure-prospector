@@ -10,6 +10,7 @@ import {
   Code2,
   Gauge,
   Gem,
+  History,
   LayoutDashboard,
   ListChecks,
   LogIn,
@@ -158,6 +159,7 @@ function App() {
   const [actions, setActions] = useState<RemediationAction[]>([])
   const [selected, setSelected] = useState<Recommendation>()
   const [activeView, setActiveView] = useState<View>('overview')
+  const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [authentication, setAuthentication] = useState<AuthStatusResponse>()
   const [loading, setLoading] = useState(true)
   const [scanning, setScanning] = useState<ScanMode>()
@@ -358,6 +360,7 @@ function App() {
         subscriptionIds,
       })
       await refresh()
+      setWorkspaceOpen(true)
       resetWorkspaceView()
       setNotice(
         `Assessment completed: ${scan.recommendationsFound} findings across ${
@@ -392,6 +395,7 @@ function App() {
         assessmentName: 'Sample workspace',
       })
       await refresh()
+      setWorkspaceOpen(true)
       resetWorkspaceView()
       setNotice(
         `Sample workspace loaded with ${scan.recommendationsFound} representative findings.`,
@@ -432,6 +436,13 @@ function App() {
     setIncludeExcepted(false)
   }
 
+  function openPreviousResults() {
+    setWorkspaceOpen(true)
+    resetWorkspaceView()
+    setNotice(undefined)
+    setError(undefined)
+  }
+
   const connectionLabel = !authentication
     ? 'Checking Azure'
     : authentication.authenticated
@@ -439,7 +450,8 @@ function App() {
         ? 'CLI connected'
         : 'Azure connected'
       : 'Connect Azure'
-  const hasAssessment = Boolean(overview?.estate.lastScanAt)
+  const hasStoredAssessment = Boolean(overview?.estate.lastScanAt)
+  const hasAssessment = workspaceOpen && hasStoredAssessment
 
   async function addException(
     recommendationId: string,
@@ -503,7 +515,7 @@ function App() {
           <BrandMark />
         </div>
 
-        {hasAssessment && (
+        {hasAssessment && overview && (
           <nav className="mt-10 space-y-1">
             {navigation.map((item) => {
               const Icon = item.icon
@@ -585,7 +597,7 @@ function App() {
                   : 'Ready for a new cost assessment'}
               </div>
             </div>
-            {overview?.estate.lastScanAt && (
+            {hasAssessment && overview && (
               <Badge variant="outline" className="hidden sm:inline-flex">
                 {overview.estate.mode === 'demo' ? 'Sample data' : 'Live data'}
               </Badge>
@@ -711,14 +723,27 @@ function App() {
               onRetry={() => void retryDashboard()}
               onDemo={() => void runDemo()}
             />
-          ) : !overview.estate.lastScanAt ? (
+          ) : !hasAssessment ? (
             <WelcomeView
               authentication={authentication}
               connecting={connecting || loadingSubscriptions}
               scanning={scanning}
+              previousAssessment={
+                hasStoredAssessment
+                  ? {
+                      name:
+                        overview.estate.assessmentName ??
+                        overview.estate.tenantName,
+                      mode: overview.estate.mode,
+                      subscriptions: overview.estate.subscriptions,
+                      lastScanAt: overview.estate.lastScanAt!,
+                    }
+                  : undefined
+              }
               onConnect={() => void connectAzure()}
               onLiveScan={() => void openAssessment()}
               onDemo={() => void runDemo()}
+              onOpenPrevious={openPreviousResults}
             />
           ) : (
             <>
@@ -955,16 +980,25 @@ function WelcomeView({
   authentication,
   connecting,
   scanning,
+  previousAssessment,
   onConnect,
   onLiveScan,
   onDemo,
+  onOpenPrevious,
 }: {
   authentication?: AuthStatusResponse
   connecting: boolean
   scanning?: ScanMode
+  previousAssessment?: {
+    name: string
+    mode: ScanMode
+    subscriptions: number
+    lastScanAt: string
+  }
   onConnect: () => void
   onLiveScan: () => void
   onDemo: () => void
+  onOpenPrevious: () => void
 }) {
   const connected = authentication?.authenticated
   return (
@@ -1057,6 +1091,32 @@ function WelcomeView({
             </CardContent>
           </Card>
         </div>
+
+        {previousAssessment && (
+          <div className="mx-auto mt-5 flex max-w-3xl flex-wrap items-center justify-between gap-4 rounded-xl border bg-card px-5 py-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-secondary text-primary">
+                <History className="size-4" aria-hidden="true" />
+              </span>
+              <div className="min-w-0">
+                <div className="truncate text-sm font-bold text-foreground">
+                  {previousAssessment.name}
+                </div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {previousAssessment.mode === 'demo' ? 'Sample' : 'Live'} ·{' '}
+                  {previousAssessment.subscriptions}{' '}
+                  {previousAssessment.subscriptions === 1
+                    ? 'subscription'
+                    : 'subscriptions'}{' '}
+                  · {formatDate(previousAssessment.lastScanAt, true)}
+                </div>
+              </div>
+            </div>
+            <Button variant="ghost" size="sm" onClick={onOpenPrevious}>
+              Open previous results
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   )

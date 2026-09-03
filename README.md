@@ -58,7 +58,8 @@ npm run app
 
 `npm run app` starts Prospector and opens `http://localhost:4310`. It opens on a
 live-first connection screen; sample data is loaded only through the explicit
-**Explore demo** action. Local data is written to
+**Explore demo** action. Previous assessment data remains stored locally but is
+shown only after choosing **Open previous results**. Local data is written to
 `data\azure-prospector.db`.
 
 Docker is also supported:
