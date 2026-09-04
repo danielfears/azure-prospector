@@ -172,7 +172,7 @@ export function SavingsActivityPanel({
               key={summary.activity}
               type="button"
               className="group flex w-full items-start gap-3 rounded-[0.625rem] border bg-secondary p-3 text-left transition-colors hover:border-[var(--cp-border-strong)] hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              aria-label={`View ${summary.resourceScopes} ${label} resource scopes with ${potential} potential monthly savings`}
+              aria-label={`View ${summary.resourceScopes} ${label} opportunity scopes with ${potential} potential monthly savings`}
               onClick={() => onSelect(summary.activity)}
             >
               <span className="flex size-9 shrink-0 items-center justify-center rounded-[0.625rem] border bg-card text-primary">
@@ -194,8 +194,8 @@ export function SavingsActivityPanel({
                 <span className="mt-1 flex items-center gap-1 text-xs font-semibold text-foreground">
                   {summary.resourceScopes}{' '}
                   {summary.resourceScopes === 1
-                    ? 'resource scope'
-                    : 'resource scopes'}
+                    ? 'opportunity scope'
+                    : 'opportunity scopes'}
                   {summary.scenarios > summary.resourceScopes
                     ? ` · ${summary.scenarios} scenarios`
                     : ''}

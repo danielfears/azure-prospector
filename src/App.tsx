@@ -1616,13 +1616,13 @@ function FindingsView({
             />
             <div>
               <div className="text-sm font-bold text-foreground">
-                Highest-value scenario per resource scope
+                Highest-value scenario per opportunity scope
               </div>
               <p className="mt-1 text-sm leading-6 text-muted-foreground">
                 Showing {displayedRecommendations.length} affected resource
-                scopes from {recommendations.length} Advisor term and lookback
-                scenarios. All source scenarios remain available in the report
-                export.
+                or commitment scopes from {recommendations.length} Advisor term
+                and lookback scenarios. All source scenarios remain available
+                in the report export.
               </p>
             </div>
           </div>
@@ -1633,7 +1633,7 @@ function FindingsView({
           <strong className="text-foreground">
             {displayedRecommendations.length}
           </strong>{' '}
-          {scenarioActivity ? 'resource scopes' : 'findings'}
+          {scenarioActivity ? 'opportunity scopes' : 'findings'}
         </span>
         <span className="font-semibold text-foreground">
           {formatCurrencyAmounts(totalValue)} potential monthly value
