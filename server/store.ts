@@ -10,6 +10,7 @@ import {
   type ExceptionRecord,
   type OverviewResponse,
   type Recommendation,
+  type RecommendationClaim,
   type RecommendationQuery,
   type RemediationAction,
   type ScanMode,
@@ -22,7 +23,10 @@ import {
   savingsOpportunityScopeKey,
 } from '../src/shared/savings-activity.js'
 import { createDemoSnapshot } from './providers/demo.js'
-import { calculateOpportunityReductionRatios } from './opportunity-scenario.js'
+import {
+  calculateOpportunityReductionRatios,
+  selectSupportedOpportunityRecommendations,
+} from './opportunity-scenario.js'
 import type {
   ProviderSnapshot,
   SnapshotRecommendation,
@@ -102,9 +106,355 @@ function recommendationActivity(
   })
 }
 
+function nullableCurrency(value: unknown): string | null {
+  const currency = asString(value).trim().toUpperCase()
+  return currency || null
+}
+
+interface StoredEvidencePoint {
+  label: string
+  value: string | number
+  unit?: string
+  source?: string
+}
+
+function storedEvidence(row: Row): StoredEvidencePoint[] {
+  try {
+    const values = parseJson<unknown[]>(row.evidence_json ?? '[]')
+    return values.flatMap((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+      const record = value as Record<string, unknown>
+      if (
+        typeof record.label !== 'string' ||
+        !['string', 'number'].includes(typeof record.value)
+      ) {
+        return []
+      }
+      return [
+        {
+          label: record.label,
+          value: record.value as string | number,
+          ...(typeof record.unit === 'string' ? { unit: record.unit } : {}),
+          ...(typeof record.source === 'string'
+            ? { source: record.source }
+            : {}),
+        },
+      ]
+    })
+  } catch {
+    return []
+  }
+}
+
+function monetaryEvidence(
+  row: Row,
+  kind: 'savings' | 'cost',
+): StoredEvidencePoint | undefined {
+  const label =
+    kind === 'savings'
+      ? /saving|monthly value|opportunity/i
+      : /cost|spend|baseline/i
+  return storedEvidence(row).find(
+    (item) =>
+      label.test(item.label) &&
+      typeof item.unit === 'string' &&
+      item.unit.trim().length > 0 &&
+      (typeof item.value === 'number'
+        ? Number.isFinite(item.value)
+        : item.value.trim().length > 0 &&
+          Number.isFinite(Number(item.value))),
+  )
+}
+
+function storedClaim(row: Row): RecommendationClaim | undefined {
+  try {
+    const parsed = parseJson<RecommendationClaim>(row.claim_json)
+    return parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.level === 'string' &&
+      parsed.provenance &&
+      parsed.overlap
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function isLegacyClaim(claim: RecommendationClaim | undefined): boolean {
+  return (
+    !claim ||
+    claim.provenance.activityClassification === 'legacy_migration' ||
+    claim.provenance.sourceApi === 'Legacy normalized recommendation' ||
+    claim.ruleVersion.startsWith('legacy-')
+  )
+}
+
+function hasTelemetryBackedScheduleClaim(
+  row: Row,
+  claim: RecommendationClaim | undefined,
+): boolean {
+  if (
+    !claim ||
+    claim.level !== 'calculated_scenario' ||
+    !claim.formula ||
+    !claim.evidenceWindow.startAt ||
+    !claim.evidenceWindow.endAt ||
+    !/azure monitor/i.test(claim.provenance.sourceApi) ||
+    !asOptionalString(row.vm_telemetry_json)
+  ) {
+    return false
+  }
+  try {
+    const telemetry = parseJson<Record<string, unknown>>(row.vm_telemetry_json)
+    const availability =
+      telemetry.availability &&
+      typeof telemetry.availability === 'object' &&
+      !Array.isArray(telemetry.availability)
+        ? (telemetry.availability as Record<string, unknown>)
+        : undefined
+    return (
+      availability !== undefined &&
+      asNumber(availability.populatedBuckets) > 0
+    )
+  } catch {
+    return false
+  }
+}
+
+function legacyClaimForRow(row: Row): RecommendationClaim {
+  const activity = recommendationActivity(row)
+  const source = asString(row.source)
+  const sourceFamily = asString(row.source_family) || `legacy:${source}`
+  const hasSavings =
+    asNumber(row.savings_amount_available ?? 1) === 1 &&
+    asNumber(row.estimated_monthly_savings) > 0 &&
+    asNumber(row.currency_available ?? 1) === 1 &&
+    nullableCurrency(row.currency) !== null
+  const scheduleLead = activity === 'shutdown_scheduling'
+  const advisorEstimate = source === 'advisor' && hasSavings
+  const calculated =
+    source === 'resource_graph' &&
+    activity === 'orphan_cleanup' &&
+    hasSavings
+  const level = scheduleLead
+    ? 'investigation_lead'
+    : advisorEstimate
+      ? 'azure_estimate'
+      : calculated
+        ? 'calculated_scenario'
+        : 'investigation_lead'
+  const scopeKey = savingsOpportunityScopeKey({
+    activity,
+    subscriptionId: asString(row.subscription_id ?? row.subscriptionId),
+    title: asString(row.title),
+    resourceType: asString(row.resource_type ?? row.resourceType),
+    resourceId: asOptionalString(row.resource_id ?? row.resourceId),
+    fingerprint: asString(row.fingerprint),
+    evidence: parseJson<
+      Array<{ label: string; value: string | number }>
+    >(row.evidence_json ?? '[]'),
+  })
+  const sequence =
+    activity === 'reserved_instances'
+      ? { sequenceStage: 'reservation' as const, sequenceOrder: 20 }
+      : activity === 'savings_plans'
+        ? { sequenceStage: 'savings_plan' as const, sequenceOrder: 30 }
+        : ['right_sizing', 'shutdown_scheduling'].includes(activity)
+          ? {
+              sequenceStage: 'usage_optimization' as const,
+              sequenceOrder: 10,
+            }
+          : { sequenceStage: 'independent' as const, sequenceOrder: 10 }
+  return {
+    level,
+    decisionStatus: hasSavings ? 'needs_validation' : 'needs_evidence',
+    validationState: advisorEstimate
+      ? 'azure_authored'
+      : calculated
+        ? 'deterministic_calculation'
+        : 'unvalidated',
+    ruleVersion: 'legacy-evidence-migration-v1',
+    provenance: {
+      provider: asString(row.provider) || 'legacy',
+      sourceFamily,
+      sourceApi: 'Legacy normalized recommendation',
+      collectedAt: asString(row.last_seen_at ?? row.lastSeenAt),
+      nativeRecommendationId: asOptionalString(
+        row.source_recommendation_id ?? row.sourceRecommendationId,
+      ),
+      activityClassification: 'legacy_migration',
+      extendedProperties: {},
+    },
+    evidenceWindow: {
+      endAt: asOptionalString(row.last_seen_at ?? row.lastSeenAt),
+      description:
+        'Legacy point-in-time observation; original evidence window was not stored.',
+    },
+    missingEvidence: [
+      'Original source metadata and evidence window were not stored',
+      ...(scheduleLead
+        ? [
+            'Historical VM runtime and utilization telemetry',
+            'External scheduler coverage',
+          ]
+        : []),
+    ],
+    overlap: {
+      scopeKey,
+      spendPoolKey: `${asString(
+        row.subscription_id ?? row.subscriptionId,
+      ).toLowerCase()}|${
+        ['reserved_instances', 'savings_plans', 'right_sizing', 'shutdown_scheduling']
+          .includes(activity)
+          ? 'compute-usage'
+          : (
+              asOptionalString(row.resource_id ?? row.resourceId) ?? scopeKey
+            ).toLowerCase()
+      }`,
+      ...(activity === 'reserved_instances' || activity === 'savings_plans'
+        ? { alternativeGroup: scopeKey }
+        : {}),
+      ...sequence,
+      mutuallyExclusiveActivities:
+        activity === 'reserved_instances'
+          ? ['savings_plans']
+          : activity === 'savings_plans'
+            ? ['reserved_instances']
+            : ['right_sizing', 'shutdown_scheduling'].includes(activity)
+              ? ['reserved_instances', 'savings_plans']
+              : [],
+    },
+  }
+}
+
+function claimFromRow(row: Row): RecommendationClaim {
+  const parsed = storedClaim(row)
+  if (parsed) {
+    return {
+      ...parsed,
+      ruleVersion: parsed.ruleVersion || 'legacy-evidence-migration-v1',
+      evidenceWindow: parsed.evidenceWindow ?? {
+        endAt: asOptionalString(row.last_seen_at ?? row.lastSeenAt),
+        description:
+          'Legacy point-in-time observation; original evidence window was not stored.',
+      },
+    }
+  }
+  return legacyClaimForRow(row)
+}
+
 function normaliseRecommendationRow(row: Row, force = false): Row {
   const activity = recommendationActivity(row, force)
-  return row.activity === activity ? row : { ...row, activity }
+  const scheduleLead = activity === 'shutdown_scheduling'
+  const originalClaim = storedClaim(row)
+  const currentClaim = !isLegacyClaim(originalClaim)
+  const evidenceCurrency =
+    monetaryEvidence(row, 'savings')?.unit ??
+    monetaryEvidence(row, 'cost')?.unit
+  const storedCurrency = nullableCurrency(row.currency)
+  const currencyAvailable = currentClaim
+    ? storedCurrency === null
+      ? 0
+      : 1
+    : evidenceCurrency &&
+        storedCurrency &&
+        evidenceCurrency.toUpperCase() === storedCurrency
+      ? 1
+      : 0
+  const savingsAvailable = currentClaim
+    ? asNumber(
+        row.savings_amount_available ??
+          (originalClaim &&
+          ['azure_estimate', 'calculated_scenario', 'measured_result'].includes(
+            originalClaim.level,
+          ) &&
+          currencyAvailable === 1 &&
+          Number.isFinite(Number(row.estimated_monthly_savings))
+            ? 1
+            : 0),
+      )
+    : monetaryEvidence(row, 'savings') && currencyAvailable === 1
+      ? 1
+      : 0
+  const currentCostAvailable = currentClaim
+    ? asNumber(
+        row.current_cost_available ??
+          (currencyAvailable === 1 &&
+          asNumber(row.current_monthly_cost) > 0
+            ? 1
+            : 0),
+      )
+    : monetaryEvidence(row, 'cost') && currencyAvailable === 1
+      ? 1
+      : 0
+  const preserveCalculatedSchedule =
+    scheduleLead && hasTelemetryBackedScheduleClaim(row, originalClaim)
+  const downgradeSchedule = scheduleLead && !preserveCalculatedSchedule
+  const normalized: Row = {
+    ...row,
+    activity,
+    savings_amount_available: downgradeSchedule
+      ? 0
+      : preserveCalculatedSchedule
+        ? 1
+        : savingsAvailable,
+    current_cost_available: currentCostAvailable,
+    currency_available: currencyAvailable,
+    estimated_monthly_savings: downgradeSchedule
+      ? 0
+      : asNumber(row.estimated_monthly_savings),
+  }
+  const existingClaim = claimFromRow(normalized)
+  const claim: RecommendationClaim = downgradeSchedule
+    ? {
+        ...existingClaim,
+        level: 'investigation_lead',
+        decisionStatus: 'needs_evidence',
+        validationState: 'unvalidated',
+        ruleVersion: force
+          ? 'legacy-evidence-migration-v1'
+          : existingClaim.ruleVersion,
+        provenance: {
+          ...existingClaim.provenance,
+          activityClassification: force
+            ? 'legacy_migration'
+            : existingClaim.provenance.activityClassification,
+        },
+        formula: undefined,
+        missingEvidence: [
+          ...new Set([
+            ...existingClaim.missingEvidence,
+            'Historical VM runtime and utilization telemetry',
+            'External scheduler coverage',
+          ]),
+        ],
+      }
+    : existingClaim
+  normalized.claim_json = JSON.stringify(claim)
+  return normalized
+}
+
+function normaliseSubscriptionRow(row: Row, legacyMigration = false): Row {
+  const monthlyCost = asNumber(row.monthly_cost)
+  const currency = nullableCurrency(row.currency)
+  const storedCurrencyAvailable = asNumber(row.currency_available ?? 0)
+  const monthlyCostAvailable =
+    legacyMigration && monthlyCost === 0 && storedCurrencyAvailable === 0
+      ? 0
+      : asNumber(
+          row.monthly_cost_available ?? (monthlyCost === 0 ? 0 : 1),
+        )
+  return {
+    ...row,
+    monthly_cost_available: monthlyCostAvailable,
+    currency_available: asNumber(
+      Math.max(
+        asNumber(row.currency_available ?? 0),
+        monthlyCost !== 0 && currency !== null ? 1 : 0,
+      ),
+    ),
+  }
 }
 
 function activeExceptionJoin(alias = 'e'): string {
@@ -120,23 +470,22 @@ function deduplicatedSavingsBy(
   recommendations: Recommendation[],
   group: (recommendation: Recommendation) => string,
 ): Map<string, number> {
-  const bestByResource = new Map<string, number>()
-  for (const recommendation of recommendations) {
-    const groupKey = group(recommendation)
-    const resourceKey = savingsOpportunityScopeKey(recommendation)
-    const key = `${groupKey}\u0000${resourceKey}`
-    bestByResource.set(
-      key,
-      Math.max(
-        bestByResource.get(key) ?? 0,
-        recommendation.estimatedMonthlySavings,
-      ),
-    )
-  }
   const totals = new Map<string, number>()
-  for (const [key, savings] of bestByResource) {
-    const groupKey = key.slice(0, key.lastIndexOf('\u0000'))
-    totals.set(groupKey, (totals.get(groupKey) ?? 0) + savings)
+  for (const recommendation of selectSupportedOpportunityRecommendations(
+    recommendations,
+  )) {
+    if (
+      recommendation.currency === null ||
+      recommendation.estimatedMonthlySavings === null
+    ) {
+      continue
+    }
+    const groupKey = group(recommendation)
+    totals.set(
+      groupKey,
+      (totals.get(groupKey) ?? 0) +
+        recommendation.estimatedMonthlySavings,
+    )
   }
   return totals
 }
@@ -227,10 +576,12 @@ export class ProspectorStore {
         name TEXT NOT NULL,
         state TEXT NOT NULL,
         monthly_cost REAL NOT NULL DEFAULT 0,
+        monthly_cost_available INTEGER NOT NULL DEFAULT 1,
         potential_monthly_savings REAL NOT NULL DEFAULT 0,
         open_recommendations INTEGER NOT NULL DEFAULT 0,
         owner_coverage REAL NOT NULL DEFAULT 0,
         currency TEXT NOT NULL,
+        currency_available INTEGER NOT NULL DEFAULT 1,
         resource_count INTEGER NOT NULL DEFAULT 0,
         observed_at TEXT NOT NULL
       );
@@ -261,8 +612,13 @@ export class ProspectorStore {
         resource_group TEXT,
         location TEXT,
         estimated_monthly_savings REAL NOT NULL DEFAULT 0,
+        savings_amount_available INTEGER NOT NULL DEFAULT 1,
         current_monthly_cost REAL NOT NULL DEFAULT 0,
+        current_cost_available INTEGER NOT NULL DEFAULT 1,
         currency TEXT NOT NULL,
+        currency_available INTEGER NOT NULL DEFAULT 1,
+        claim_json TEXT NOT NULL DEFAULT '{}',
+        vm_telemetry_json TEXT,
         confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
         confidence_band TEXT NOT NULL,
         effort TEXT NOT NULL,
@@ -290,6 +646,8 @@ export class ProspectorStore {
         status TEXT NOT NULL,
         source TEXT NOT NULL,
         action TEXT,
+        covered_count INTEGER,
+        total_count INTEGER,
         observed_at TEXT NOT NULL
       );
 
@@ -421,6 +779,24 @@ export class ProspectorStore {
         'ALTER TABLE subscriptions ADD COLUMN tenant_id TEXT',
       )
     }
+    if (
+      !subscriptionColumns.some(
+        (column) => asString(column.name) === 'monthly_cost_available',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE subscriptions ADD COLUMN monthly_cost_available INTEGER NOT NULL DEFAULT 1',
+      )
+    }
+    if (
+      !subscriptionColumns.some(
+        (column) => asString(column.name) === 'currency_available',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE subscriptions ADD COLUMN currency_available INTEGER NOT NULL DEFAULT 0',
+      )
+    }
     const recommendationColumns = this.database
       .prepare('PRAGMA table_info(recommendations)')
       .all() as Row[]
@@ -438,11 +814,79 @@ export class ProspectorStore {
          ))`,
       )
     }
+    if (
+      !recommendationColumns.some(
+        (column) => asString(column.name) === 'savings_amount_available',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE recommendations ADD COLUMN savings_amount_available INTEGER NOT NULL DEFAULT 1',
+      )
+    }
+    if (
+      !recommendationColumns.some(
+        (column) => asString(column.name) === 'current_cost_available',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE recommendations ADD COLUMN current_cost_available INTEGER NOT NULL DEFAULT 1',
+      )
+    }
+    if (
+      !recommendationColumns.some(
+        (column) => asString(column.name) === 'claim_json',
+      )
+    ) {
+      this.database.exec(
+        "ALTER TABLE recommendations ADD COLUMN claim_json TEXT NOT NULL DEFAULT '{}'",
+      )
+    }
+    if (
+      !recommendationColumns.some(
+        (column) => asString(column.name) === 'currency_available',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE recommendations ADD COLUMN currency_available INTEGER NOT NULL DEFAULT 0',
+      )
+    }
+    if (
+      !recommendationColumns.some(
+        (column) => asString(column.name) === 'vm_telemetry_json',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE recommendations ADD COLUMN vm_telemetry_json TEXT',
+      )
+    }
+    const coverageColumns = this.database
+      .prepare('PRAGMA table_info(coverage)')
+      .all() as Row[]
+    if (
+      !coverageColumns.some(
+        (column) => asString(column.name) === 'covered_count',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE coverage ADD COLUMN covered_count INTEGER',
+      )
+    }
+    if (
+      !coverageColumns.some(
+        (column) => asString(column.name) === 'total_count',
+      )
+    ) {
+      this.database.exec(
+        'ALTER TABLE coverage ADD COLUMN total_count INTEGER',
+      )
+    }
     const activityMigrationComplete =
       this.getMetadata('schema_savings_activity_v1') === 'complete'
     this.migrateSavingsActivities(
       activityColumnAdded || !activityMigrationComplete,
     )
+    this.migrateEvidenceClaims()
+    this.migrateFinancialAvailability()
     this.database.exec(`
       INSERT OR IGNORE INTO currency_cost_trend (
         provider, currency, period, actual_cost, optimized_cost,
@@ -479,18 +923,26 @@ export class ProspectorStore {
     this.database.exec('BEGIN IMMEDIATE')
     try {
       const activeRows = this.database
-        .prepare(
-          `SELECT id, activity, title, description, category, resource_type
-           FROM recommendations`,
-        )
+        .prepare('SELECT * FROM recommendations')
         .all() as Row[]
       const updateRecommendation = this.database.prepare(
-        'UPDATE recommendations SET activity = ? WHERE id = ?',
+        `UPDATE recommendations
+         SET activity = ?, estimated_monthly_savings = ?,
+           savings_amount_available = ?, currency_available = ?, claim_json = ?
+         WHERE id = ?`,
       )
       for (const row of activeRows) {
         if (!forceActiveBackfill && isSavingsActivity(row.activity)) continue
+        const normalized = normaliseRecommendationRow(
+          row,
+          forceActiveBackfill,
+        )
         updateRecommendation.run(
-          recommendationActivity(row, forceActiveBackfill),
+          normalized.activity as SqlValue,
+          normalized.estimated_monthly_savings as SqlValue,
+          normalized.savings_amount_available as SqlValue,
+          normalized.currency_available as SqlValue,
+          normalized.claim_json as SqlValue,
           asString(row.id),
         )
       }
@@ -547,6 +999,190 @@ export class ProspectorStore {
           new Date().toISOString(),
         )
       }
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private migrateEvidenceClaims(): void {
+    if (this.getMetadata('schema_evidence_claim_v1') === 'complete') return
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const activeRows = this.database
+        .prepare('SELECT * FROM recommendations')
+        .all() as Row[]
+      const update = this.database.prepare(
+        `UPDATE recommendations
+         SET activity = ?, estimated_monthly_savings = ?,
+           savings_amount_available = ?, current_cost_available = ?,
+           currency_available = ?,
+           claim_json = ?
+         WHERE id = ?`,
+      )
+      for (const row of activeRows) {
+        const normalized = normaliseRecommendationRow(row)
+        update.run(
+          normalized.activity as SqlValue,
+          normalized.estimated_monthly_savings as SqlValue,
+          normalized.savings_amount_available as SqlValue,
+          normalized.current_cost_available as SqlValue,
+          normalized.currency_available as SqlValue,
+          normalized.claim_json as SqlValue,
+          asString(row.id),
+        )
+      }
+
+      const assessments = this.database
+        .prepare('SELECT id, workspace_json FROM assessments')
+        .all() as Row[]
+      const updateWorkspace = this.database.prepare(
+        'UPDATE assessments SET workspace_json = ? WHERE id = ?',
+      )
+      for (const assessment of assessments) {
+        let workspace: unknown
+        try {
+          workspace = JSON.parse(asString(assessment.workspace_json))
+        } catch {
+          continue
+        }
+        if (
+          !workspace ||
+          typeof workspace !== 'object' ||
+          Array.isArray(workspace)
+        ) {
+          continue
+        }
+        const record = workspace as Record<string, unknown>
+        const recommendations = Array.isArray(record.recommendations)
+          ? record.recommendations.map((value) =>
+              value && typeof value === 'object' && !Array.isArray(value)
+                ? normaliseRecommendationRow(value as Row)
+                : value,
+            )
+          : record.recommendations
+        const subscriptions = Array.isArray(record.subscriptions)
+          ? record.subscriptions.map((value) =>
+              value && typeof value === 'object' && !Array.isArray(value)
+                ? normaliseSubscriptionRow(value as Row)
+                : value,
+            )
+          : record.subscriptions
+        updateWorkspace.run(
+          JSON.stringify({ ...record, recommendations, subscriptions }),
+          asString(assessment.id),
+        )
+      }
+      this.setMetadata(
+        'schema_evidence_claim_v1',
+        'complete',
+        new Date().toISOString(),
+      )
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private migrateFinancialAvailability(): void {
+    if (
+      this.getMetadata('schema_financial_availability_v2') === 'complete'
+    ) {
+      return
+    }
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const recommendations = this.database
+        .prepare('SELECT * FROM recommendations')
+        .all() as Row[]
+      const updateRecommendation = this.database.prepare(
+        `UPDATE recommendations
+         SET estimated_monthly_savings = ?, savings_amount_available = ?,
+           current_cost_available = ?, currency_available = ?, claim_json = ?
+         WHERE id = ?`,
+      )
+      for (const row of recommendations) {
+        const normalized = normaliseRecommendationRow(row)
+        updateRecommendation.run(
+          normalized.estimated_monthly_savings as SqlValue,
+          normalized.savings_amount_available as SqlValue,
+          normalized.current_cost_available as SqlValue,
+          normalized.currency_available as SqlValue,
+          normalized.claim_json as SqlValue,
+          asString(row.id),
+        )
+      }
+
+      const subscriptions = this.database
+        .prepare('SELECT * FROM subscriptions')
+        .all() as Row[]
+      const updateSubscription = this.database.prepare(
+        `UPDATE subscriptions
+         SET monthly_cost_available = ?, currency_available = ?
+         WHERE id = ?`,
+      )
+      for (const row of subscriptions) {
+        const normalized = normaliseSubscriptionRow(row, true)
+        updateSubscription.run(
+          normalized.monthly_cost_available as SqlValue,
+          normalized.currency_available as SqlValue,
+          asString(row.id),
+        )
+      }
+
+      const assessments = this.database
+        .prepare('SELECT id, workspace_json FROM assessments')
+        .all() as Row[]
+      const updateWorkspace = this.database.prepare(
+        'UPDATE assessments SET workspace_json = ? WHERE id = ?',
+      )
+      for (const assessment of assessments) {
+        let workspace: unknown
+        try {
+          workspace = JSON.parse(asString(assessment.workspace_json))
+        } catch {
+          continue
+        }
+        if (
+          !workspace ||
+          typeof workspace !== 'object' ||
+          Array.isArray(workspace)
+        ) {
+          continue
+        }
+        const record = workspace as Record<string, unknown>
+        updateWorkspace.run(
+          JSON.stringify({
+            ...record,
+            recommendations: Array.isArray(record.recommendations)
+              ? record.recommendations.map((value) =>
+                  value &&
+                  typeof value === 'object' &&
+                  !Array.isArray(value)
+                    ? normaliseRecommendationRow(value as Row)
+                    : value,
+                )
+              : record.recommendations,
+            subscriptions: Array.isArray(record.subscriptions)
+              ? record.subscriptions.map((value) =>
+                  value &&
+                  typeof value === 'object' &&
+                  !Array.isArray(value)
+                    ? normaliseSubscriptionRow(value as Row, true)
+                    : value,
+                )
+              : record.subscriptions,
+          }),
+          asString(assessment.id),
+        )
+      }
+      this.setMetadata(
+        'schema_financial_availability_v2',
+        'complete',
+        new Date().toISOString(),
+      )
       this.database.exec('COMMIT')
     } catch (error) {
       this.database.exec('ROLLBACK')
@@ -642,7 +1278,10 @@ export class ProspectorStore {
 
   private restoreWorkspace(workspace: WorkspaceSnapshot): void {
     this.insertRows('metadata', workspace.metadata)
-    this.insertRows('subscriptions', workspace.subscriptions)
+    this.insertRows(
+      'subscriptions',
+      workspace.subscriptions.map((row) => normaliseSubscriptionRow(row)),
+    )
     this.insertRows(
       'recommendations',
       workspace.recommendations.map((row) => normaliseRecommendationRow(row)),
@@ -1304,9 +1943,11 @@ export class ProspectorStore {
       this.database.prepare('DELETE FROM subscriptions').run()
       const subscriptionStatement = this.database.prepare(
         `INSERT INTO subscriptions (
-          id, provider, tenant_id, name, state, monthly_cost, potential_monthly_savings,
-          open_recommendations, owner_coverage, currency, resource_count, observed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, provider, tenant_id, name, state, monthly_cost,
+          monthly_cost_available, potential_monthly_savings,
+          open_recommendations, owner_coverage, currency, currency_available,
+          resource_count, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       for (const subscription of snapshot.subscriptions) {
         subscriptionStatement.run(
@@ -1315,11 +1956,13 @@ export class ProspectorStore {
           subscription.tenantId ?? snapshot.tenantId ?? null,
           subscription.name,
           subscription.state,
-          subscription.monthlyCost,
+          subscription.monthlyCost ?? 0,
+          subscription.monthlyCost === null ? 0 : 1,
           subscription.potentialMonthlySavings,
           subscription.openRecommendations,
           subscription.ownerCoverage,
-          subscription.currency,
+          subscription.currency ?? '',
+          subscription.currency === null ? 0 : 1,
           subscription.resourceCount,
           now,
         )
@@ -1329,8 +1972,8 @@ export class ProspectorStore {
       const coverageStatement = this.database.prepare(
         `INSERT INTO coverage (
           key, provider, label, description, percentage, status, source, action,
-          observed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          covered_count, total_count, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       for (const item of snapshot.coverage) {
         coverageStatement.run(
@@ -1342,6 +1985,8 @@ export class ProspectorStore {
           item.status,
           item.source,
           item.action ?? null,
+          item.coveredCount ?? null,
+          item.totalCount ?? null,
           now,
         )
       }
@@ -1360,9 +2005,9 @@ export class ProspectorStore {
             snapshot.provider,
             trend.currency,
             point.period,
-            point.actualCost,
-            point.optimizedCost,
-            point.realizedSavings,
+            point.observedAmortizedCost,
+            point.opportunityScenarioCost,
+            point.measuredSavings ?? 0,
             now,
           )
         }
@@ -1374,13 +2019,16 @@ export class ProspectorStore {
           source_recommendation_id, category, activity, title, description,
           suggested_action, tenant_id, subscription_id, subscription_name,
           resource_id, resource_name, resource_type, resource_group, location,
-          estimated_monthly_savings, current_monthly_cost, currency, confidence,
+          estimated_monthly_savings, savings_amount_available,
+          current_monthly_cost, current_cost_available, currency,
+          currency_available, claim_json,
+          vm_telemetry_json, confidence,
           confidence_band, effort, risk, status, owner_display_name, owner_email,
           owner_source, owner_confidence, evidence_json, tags_json, first_seen_at,
           last_seen_at, resolved_at, last_scan_id
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           fingerprint = excluded.fingerprint,
@@ -1402,8 +2050,13 @@ export class ProspectorStore {
           resource_group = excluded.resource_group,
           location = excluded.location,
           estimated_monthly_savings = excluded.estimated_monthly_savings,
+          savings_amount_available = excluded.savings_amount_available,
           current_monthly_cost = excluded.current_monthly_cost,
+          current_cost_available = excluded.current_cost_available,
           currency = excluded.currency,
+          currency_available = excluded.currency_available,
+          claim_json = excluded.claim_json,
+          vm_telemetry_json = excluded.vm_telemetry_json,
           confidence = excluded.confidence,
           confidence_band = excluded.confidence_band,
           effort = excluded.effort,
@@ -1481,7 +2134,7 @@ export class ProspectorStore {
       const estimatedSavingsByCurrency = [
         ...deduplicatedSavingsBy(
           snapshot.recommendations,
-          (recommendation) => recommendation.currency,
+          (recommendation) => recommendation.currency ?? '',
         ).entries(),
       ]
         .map(([currency, amount]) => ({ currency, amount }))
@@ -1563,9 +2216,14 @@ export class ProspectorStore {
       item.resourceType,
       item.resourceGroup ?? null,
       item.location ?? null,
-      item.estimatedMonthlySavings,
-      item.currentMonthlyCost,
-      item.currency,
+      item.estimatedMonthlySavings ?? 0,
+      item.estimatedMonthlySavings === null ? 0 : 1,
+      item.currentMonthlyCost ?? 0,
+      item.currentMonthlyCost === null ? 0 : 1,
+      item.currency ?? '',
+      item.currency === null ? 0 : 1,
+      JSON.stringify(item.claim),
+      item.vmTelemetry ? JSON.stringify(item.vmTelemetry) : null,
       item.confidence,
       item.confidenceBand,
       item.effort,
@@ -1698,6 +2356,11 @@ export class ProspectorStore {
         }
       : undefined
 
+    const claim = claimFromRow(row)
+    const estimatedMonthlySavings =
+      asNumber(row.savings_amount_available ?? 1) === 1
+        ? asNumber(row.estimated_monthly_savings)
+        : null
     return {
       id: asString(row.id),
       fingerprint: asString(row.fingerprint),
@@ -1716,9 +2379,31 @@ export class ProspectorStore {
       resourceType: asString(row.resource_type),
       resourceGroup: asOptionalString(row.resource_group),
       location: asOptionalString(row.location),
-      estimatedMonthlySavings: asNumber(row.estimated_monthly_savings),
-      currentMonthlyCost: asNumber(row.current_monthly_cost),
-      currency: asString(row.currency),
+      estimatedMonthlySavings,
+      azureEstimatedMonthlySavings:
+        claim.level === 'azure_estimate'
+          ? estimatedMonthlySavings
+          : null,
+      calculatedMonthlySavings:
+        claim.level === 'calculated_scenario'
+          ? estimatedMonthlySavings
+          : null,
+      measuredMonthlySavings:
+        claim.level === 'measured_result'
+          ? estimatedMonthlySavings
+          : null,
+      currentMonthlyCost:
+        asNumber(row.current_cost_available ?? 1) === 1
+          ? asNumber(row.current_monthly_cost)
+          : null,
+      currency:
+        asNumber(row.currency_available ?? 0) === 1
+          ? nullableCurrency(row.currency)
+          : null,
+      claim,
+      vmTelemetry: row.vm_telemetry_json
+        ? parseJson<Recommendation['vmTelemetry']>(row.vm_telemetry_json)
+        : undefined,
       confidence: asNumber(row.confidence),
       confidenceBand: asString(
         row.confidence_band,
@@ -2047,7 +2732,7 @@ export class ProspectorStore {
     )
     const potentialSavingsByCurrency = deduplicatedSavingsBy(
       activeRecommendations,
-      (recommendation) => recommendation.currency,
+      (recommendation) => recommendation.currency ?? '',
     )
     const potentialSavingsByCategory = deduplicatedSavingsBy(
       activeRecommendations,
@@ -2062,7 +2747,8 @@ export class ProspectorStore {
 
     const subscriptionRows = this.database
       .prepare(
-        `SELECT s.id, s.tenant_id, s.name, s.state, s.monthly_cost, s.currency,
+        `SELECT s.id, s.tenant_id, s.name, s.state, s.monthly_cost,
+          s.monthly_cost_available, s.currency, s.currency_available,
           COALESCE(v.potential_monthly_savings, 0) AS potential_monthly_savings,
           COALESCE(a.open_recommendations, 0) AS open_recommendations,
           CASE
@@ -2124,64 +2810,76 @@ export class ProspectorStore {
       .prepare('SELECT * FROM coverage ORDER BY key')
       .all() as Row[]
 
-    const verifiedPeriods = trendRows.filter(
-      (row) => asNumber(row.realized_savings) > 0,
-    ).length
-    const measurementCoverage = trendRows.length
-      ? (verifiedPeriods / trendRows.length) * 100
-      : 0
     const billingCurrencies = [
       ...new Set(
         [
-          ...subscriptionRows.map((row) => asString(row.currency)),
-          ...categoryRows.map((row) => asString(row.currency)),
+          ...subscriptionRows
+            .filter(
+              (row) => asNumber(row.currency_available ?? 0) === 1,
+            )
+            .map((row) => asString(row.currency)),
+          ...activeRecommendations.map(
+            (recommendation) => recommendation.currency ?? '',
+          ),
           ...trendRows.map((row) => asString(row.currency)),
-        ].filter(Boolean),
+        ].filter((currency) => Boolean(currency)),
       ),
     ].sort()
     const opportunityRatios = calculateOpportunityReductionRatios(
       activeRecommendations,
       subscriptionRows.map((row) => ({
-        currency: asString(row.currency),
-        monthlyCost: asNumber(row.monthly_cost),
+        currency:
+          asNumber(row.currency_available ?? 0) === 1
+            ? nullableCurrency(row.currency)
+            : null,
+        monthlyCost:
+          asNumber(row.monthly_cost_available ?? 1) === 1
+            ? asNumber(row.monthly_cost)
+            : null,
       })),
     )
     const currencySummaries = billingCurrencies.map((currencyCode) => {
       const currencyTrendRows = trendRows.filter(
         (row) => asString(row.currency) === currencyCode,
       )
-      const realizedSavingsAllTime = currencyTrendRows.reduce(
-        (sum, row) => sum + asNumber(row.realized_savings),
-        0,
-      )
-      const lastTrend = currencyTrendRows.at(-1)
-      const currencyVerifiedPeriods = currencyTrendRows.filter(
-        (row) => asNumber(row.realized_savings) > 0,
-      ).length
       const potentialMonthlySavings =
         potentialSavingsByCurrency.get(currencyCode) ?? 0
       return {
         currency: currencyCode,
+        costBasis: 'median_completed_month_amortized_pretax_cost' as const,
         monthlyCost: subscriptionRows
-          .filter((row) => asString(row.currency) === currencyCode)
+          .filter(
+            (row) =>
+              asNumber(row.currency_available ?? 0) === 1 &&
+              asString(row.currency) === currencyCode,
+          )
+          .filter(
+            (row) => asNumber(row.monthly_cost_available ?? 1) === 1,
+          )
           .reduce((sum, row) => sum + asNumber(row.monthly_cost), 0),
         potentialMonthlySavings,
         annualizedPotentialSavings: potentialMonthlySavings * 12,
-        realizedSavingsLast30Days: lastTrend
-          ? asNumber(lastTrend.realized_savings)
-          : 0,
-        realizedSavingsAllTime,
-        verifiedMeasurementCount: currencyVerifiedPeriods,
-        measurementCoverage: currencyTrendRows.length
-          ? (currencyVerifiedPeriods / currencyTrendRows.length) * 100
-          : 0,
+        annualizationMethod: 'monthly_estimate_x_12' as const,
+        measuredSavingsLast30Days: null,
+        measuredSavingsAllTime: null,
+        measuredResultCount: 0,
+        measuredResultCoverage: null,
+        measurementCoverage: 0,
+        realizedSavingsLast30Days: 0,
+        realizedSavingsAllTime: 0,
+        verifiedMeasurementCount: 0,
         costTrend: currencyTrendRows.map((row) => ({
           period: asString(row.period),
+          observedAmortizedCost: asNumber(row.actual_cost),
+          opportunityScenarioCost:
+            asNumber(row.actual_cost) *
+            (1 - (opportunityRatios.get(currencyCode) ?? 0)),
+          measuredSavings: null,
           actualCost: asNumber(row.actual_cost),
           optimizedCost:
             asNumber(row.actual_cost) *
             (1 - (opportunityRatios.get(currencyCode) ?? 0)),
-          realizedSavings: asNumber(row.realized_savings),
+          realizedSavings: 0,
         })),
       }
     })
@@ -2203,8 +2901,10 @@ export class ProspectorStore {
       },
       savings: {
         byCurrency: currencySummaries,
-        verifiedMeasurementCount: verifiedPeriods,
-        measurementCoverage,
+        measuredResultCount: 0,
+        measuredResultCoverage: null,
+        measurementCoverage: 0,
+        verifiedMeasurementCount: 0,
       },
       openRecommendations: asNumber(summary.open_count),
       highConfidenceRecommendations: asNumber(summary.high_confidence_count),
@@ -2218,14 +2918,25 @@ export class ProspectorStore {
             (sum, row) => sum + asNumber(row.recommendations),
             0,
           ),
-          estimatedMonthlySavings: rows
-            .map((row) => ({
-              currency: asString(row.currency),
+          estimatedMonthlySavings: [
+            ...new Set(
+              activeRecommendations
+                .filter(
+                  (recommendation) =>
+                    recommendation.category === category &&
+                    recommendation.currency !== null,
+                )
+                .map((recommendation) => recommendation.currency as string),
+            ),
+          ]
+            .map((currency) => ({
+              currency,
               amount:
                 potentialSavingsByCategory.get(
-                  `${category}\u0000${asString(row.currency)}`,
+                  `${category}\u0000${currency}`,
                 ) ?? 0,
             }))
+            .filter((amount) => amount.amount > 0)
             .sort((left, right) =>
               left.currency.localeCompare(right.currency),
             ),
@@ -2237,7 +2948,10 @@ export class ProspectorStore {
           name: asString(row.name),
           tenantId: asOptionalString(row.tenant_id),
           state: asString(row.state),
-          monthlyCost: asNumber(row.monthly_cost),
+          monthlyCost:
+            asNumber(row.monthly_cost_available ?? 1) === 1
+              ? asNumber(row.monthly_cost)
+              : null,
           potentialMonthlySavings: asNumber(
             potentialSavingsBySubscription.get(
               `${asString(row.id)}\u0000${asString(row.currency)}`,
@@ -2245,7 +2959,11 @@ export class ProspectorStore {
           ),
           openRecommendations: asNumber(row.open_recommendations),
           ownerCoverage: asNumber(row.owner_coverage),
-          currency: asString(row.currency),
+          currency:
+            asNumber(row.currency_available ?? 0) === 1
+              ? nullableCurrency(row.currency)
+              : null,
+          costBasis: 'median_completed_month_amortized_pretax_cost',
         }),
       ),
       coverage: coverage.map(
@@ -2257,6 +2975,12 @@ export class ProspectorStore {
           status: asString(row.status) as CoverageItem['status'],
           source: asString(row.source),
           action: asOptionalString(row.action),
+          ...(row.covered_count === null || row.covered_count === undefined
+            ? {}
+            : { coveredCount: asNumber(row.covered_count) }),
+          ...(row.total_count === null || row.total_count === undefined
+            ? {}
+            : { totalCount: asNumber(row.total_count) }),
         }),
       ),
       recentScans: scope.assessmentId

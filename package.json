@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@azure/identity": "^4.13.2",
+    "@azure/monitor-query-metrics": "^1.0.0",
     "@radix-ui/react-dialog": "^1.1.23",
     "@radix-ui/react-progress": "^1.1.16",
     "@radix-ui/react-slot": "^1.3.3",

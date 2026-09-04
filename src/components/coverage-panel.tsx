@@ -32,7 +32,7 @@ export function CoveragePanel({ coverage }: CoveragePanelProps) {
                 <Icon
                   className={cn(
                     'mt-0.5 size-4 shrink-0',
-                    item.status === 'complete' && 'text-success',
+                    item.status === 'complete' && 'text-foreground',
                     item.status === 'partial' && 'text-warning',
                     item.status === 'missing' && 'text-destructive',
                     item.status === 'unavailable' &&
@@ -44,6 +44,9 @@ export function CoveragePanel({ coverage }: CoveragePanelProps) {
                   <div className="text-sm font-semibold text-foreground">{item.label}</div>
                   <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
                     {item.description}
+                  </div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    Source: {item.source}
                   </div>
                 </div>
               </div>

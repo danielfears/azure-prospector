@@ -7,12 +7,24 @@ import {
   type TokenCredential,
 } from '@azure/identity'
 import type {
+  Metric,
+  MetricUnit,
+} from '@azure/monitor-query-metrics'
+import type {
   ConfidenceBand,
   EvidencePoint,
+  RecommendationClaim,
   RecommendationCategory,
   RecommendationOwner,
+  SavingsActivity,
+  SerializableScalar,
+  VmActivityLogEvent,
+  VmTelemetryEvidence,
 } from '../../src/shared/types.js'
-import { classifySavingsActivity } from '../../src/shared/savings-activity.js'
+import {
+  classifySavingsActivity,
+  savingsOpportunityScopeKey,
+} from '../../src/shared/savings-activity.js'
 import type {
   ProspectorProvider,
   ProviderCollectRequest,
@@ -21,12 +33,30 @@ import type {
   SnapshotSubscription,
 } from './types.js'
 import { configuredSubscriptionIds } from '../azure-config.js'
-import { calculateOpportunityReductionRatios } from '../opportunity-scenario.js'
+import {
+  calculateOpportunityReductionRatios,
+  selectSupportedOpportunityRecommendations,
+} from '../opportunity-scenario.js'
+import {
+  collectVmTelemetry,
+  completedThirtyDayWindow,
+  evaluateVmScheduleScenario,
+  type ActivityLogQueryResult,
+  type AvailabilityMetricQuery,
+  type MetricsClientFactory,
+  VM_SCHEDULE_MINIMUM_COVERAGE,
+  type VmTelemetryCandidate,
+} from '../vm-telemetry.js'
 
 const ARM_ORIGIN = 'https://management.azure.com'
 const ARM_SCOPE = 'https://management.azure.com/.default'
 const RESOURCE_GRAPH_API_VERSION = '2022-10-01'
 const COST_API_VERSION = '2023-11-01'
+const ACTIVITY_LOG_API_VERSION = '2015-04-01'
+const METRICS_API_VERSION = '2023-10-01'
+const ADVISOR_RULE_VERSION = 'azure-advisor-v2'
+const ORPHAN_RULE_VERSION = 'azure-resource-orphan-v2'
+const SCHEDULE_RULE_VERSION = 'devtestlab-schedule-gap-v2'
 const DEFAULT_OWNER_TAGS = [
   'owner',
   'serviceOwner',
@@ -62,6 +92,7 @@ interface CostQueryResult {
   subscriptionId: string
   currency?: string
   representativeByResource: Map<string, number>
+  representativeVariableByResource: Map<string, number>
   monthlyTotals: Map<string, number>
   representativeTotal: number
 }
@@ -218,6 +249,97 @@ function asObject(value: unknown): Record<string, unknown> {
     : {}
 }
 
+const METRIC_UNITS = new Set<MetricUnit>([
+  'Count',
+  'Bytes',
+  'Seconds',
+  'CountPerSecond',
+  'BytesPerSecond',
+  'Percent',
+  'MilliSeconds',
+  'ByteSeconds',
+  'Unspecified',
+  'Cores',
+  'MilliCores',
+  'NanoCores',
+  'BitsPerSecond',
+])
+
+function metricUnit(value: unknown): MetricUnit {
+  return typeof value === 'string' && METRIC_UNITS.has(value as MetricUnit)
+    ? (value as MetricUnit)
+    : 'Unspecified'
+}
+
+function resourceScopedMetric(value: unknown): Metric | undefined {
+  const row = asObject(value)
+  const nameObject = asObject(row.name)
+  const name =
+    firstString(nameObject, ['value', 'localizedValue']) ??
+    (typeof row.name === 'string' ? row.name : undefined)
+  if (!name) return undefined
+  const timeseries = Array.isArray(row.timeseries) ? row.timeseries : []
+  return {
+    id: typeof row.id === 'string' ? row.id : name,
+    type: typeof row.type === 'string' ? row.type : 'Microsoft.Insights/metrics',
+    name,
+    unit: metricUnit(row.unit),
+    ...(typeof row.errorCode === 'string'
+      ? { errorCode: row.errorCode }
+      : {}),
+    ...(typeof row.errorMessage === 'string'
+      ? { errorMessage: row.errorMessage }
+      : {}),
+    timeseries: timeseries.map((value) => {
+      const series = asObject(value)
+      const metadata = Array.isArray(series.metadatavalues)
+        ? series.metadatavalues
+        : []
+      const data = Array.isArray(series.data) ? series.data : []
+      return {
+        metadatavalues: metadata.flatMap((value) => {
+          const item = asObject(value)
+          const metadataName = asObject(item.name)
+          const dimensionName =
+            firstString(metadataName, ['value', 'localizedValue']) ??
+            (typeof item.name === 'string' ? item.name : undefined)
+          return dimensionName && typeof item.value === 'string'
+            ? [{ name: dimensionName, value: item.value }]
+            : []
+        }),
+        data: data.flatMap((value) => {
+          const point = asObject(value)
+          const timestamp =
+            typeof point.timeStamp === 'string'
+              ? new Date(point.timeStamp)
+              : undefined
+          if (!timestamp || Number.isNaN(timestamp.getTime())) return []
+          return [
+            {
+              timeStamp: timestamp,
+              ...(finiteNumber(point.average) !== undefined
+                ? { average: finiteNumber(point.average) }
+                : {}),
+              ...(finiteNumber(point.minimum) !== undefined
+                ? { minimum: finiteNumber(point.minimum) }
+                : {}),
+              ...(finiteNumber(point.maximum) !== undefined
+                ? { maximum: finiteNumber(point.maximum) }
+                : {}),
+              ...(finiteNumber(point.total) !== undefined
+                ? { total: finiteNumber(point.total) }
+                : {}),
+              ...(finiteNumber(point.count) !== undefined
+                ? { count: finiteNumber(point.count) }
+                : {}),
+            },
+          ]
+        }),
+      }
+    }),
+  }
+}
+
 function resourceRecord(value: unknown): ResourceRecord | undefined {
   const row = asObject(value)
   const id = typeof row.id === 'string' ? row.id : ''
@@ -334,8 +456,122 @@ function formatCommitmentTerm(value: string | undefined): string | undefined {
 function resourceCost(
   resourceId: string,
   costs: Map<string, number>,
-): number {
-  return costs.get(resourceId.toLowerCase()) ?? 0
+): number | null {
+  return costs.get(resourceId.toLowerCase()) ?? null
+}
+
+const ADVISOR_ACTIVITY_BY_TYPE_ID = new Map<string, SavingsActivity>([
+  ['84b1a508-fc21-49da-979e-96894f1665df', 'savings_plans'],
+  ['8ee30d6b-2a1c-45f3-93f0-df6962034a33', 'reserved_instances'],
+  ['885cd4f5-dfa0-4d68-bbfd-00f89fc2b69c', 'reserved_instances'],
+  ['db621e98-4a20-4942-b174-c455dc71dbae', 'reserved_instances'],
+  ['89515250-1243-43d1-b4e7-f9437cedffd8', 'reserved_instances'],
+  ['680a5388-28aa-44e8-88af-32e3598dc869', 'reserved_instances'],
+  ['0eb54047-acd9-4f26-8ffb-8cec713782d6', 'reserved_instances'],
+  ['0169a2e1-c7bf-4c37-90b8-0714811c82d3', 'reserved_instances'],
+  ['a205074f-8049-48b3-903f-556f5e530ae3', 'reserved_instances'],
+  ['a8fd63ce-4600-43eb-af33-a6d5481f5930', 'reserved_instances'],
+])
+const ADVISOR_INACTIVE_VM_TYPE_IDS = new Set([
+  'e10b1381-5f0a-47ff-8c7b-37bd13d7c974',
+  '94aea435-ef39-493f-a547-8408092c22a7',
+])
+
+export function classifyAdvisorSavingsActivity(input: {
+  recommendationTypeId?: string
+  title: string
+  description: string
+  category: string
+  resourceType: string
+}): {
+  activity: SavingsActivity
+  method: 'recommendation_type_id' | 'text_fallback'
+} {
+  const mapped = input.recommendationTypeId
+    ? ADVISOR_ACTIVITY_BY_TYPE_ID.get(input.recommendationTypeId.toLowerCase())
+    : undefined
+  return mapped
+    ? { activity: mapped, method: 'recommendation_type_id' }
+    : {
+        activity: classifySavingsActivity(input),
+        method: 'text_fallback',
+      }
+}
+
+function scalarExtendedProperties(
+  value: Record<string, unknown>,
+): Record<string, SerializableScalar> {
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, SerializableScalar] =>
+        entry[1] === null ||
+        ['string', 'number', 'boolean'].includes(typeof entry[1]),
+    ),
+  )
+}
+
+function normalizedAdvisorStatus(
+  properties: Record<string, unknown>,
+): string | undefined {
+  return firstString(properties, ['recommendationStatus', 'status'])
+}
+
+function isActiveAdvisorRecommendation(
+  properties: Record<string, unknown>,
+): boolean {
+  const status = normalizedAdvisorStatus(properties)
+  if (!status) return false
+  const normalized = status.toLowerCase().replaceAll(/[\s_-]/g, '')
+  return ['new', 'active', 'inprogress'].includes(normalized)
+}
+
+function overlapIdentity(input: {
+  activity: SavingsActivity
+  subscriptionId: string
+  resourceType: string
+  resourceId?: string
+  fingerprint: string
+  title: string
+  evidence: EvidencePoint[]
+}): RecommendationClaim['overlap'] {
+  const scopeKey = savingsOpportunityScopeKey(input)
+  const computeSpendPool =
+    /compute|virtualmachines?|managedclusters|agentpools/i.test(
+      input.resourceType,
+    ) ||
+    ['reserved_instances', 'savings_plans', 'right_sizing', 'shutdown_scheduling']
+      .includes(input.activity)
+  const stage =
+    input.activity === 'reserved_instances'
+      ? { sequenceStage: 'reservation' as const, sequenceOrder: 20 }
+      : input.activity === 'savings_plans'
+        ? { sequenceStage: 'savings_plan' as const, sequenceOrder: 30 }
+        : ['right_sizing', 'shutdown_scheduling'].includes(input.activity)
+          ? {
+              sequenceStage: 'usage_optimization' as const,
+              sequenceOrder: 10,
+            }
+          : { sequenceStage: 'independent' as const, sequenceOrder: 10 }
+  const mutuallyExclusiveActivities: SavingsActivity[] =
+    input.activity === 'reserved_instances'
+      ? ['savings_plans']
+      : input.activity === 'savings_plans'
+        ? ['reserved_instances']
+        : ['right_sizing', 'shutdown_scheduling'].includes(input.activity)
+          ? ['reserved_instances', 'savings_plans']
+          : []
+  return {
+    scopeKey,
+    spendPoolKey: computeSpendPool
+      ? `${input.subscriptionId.toLowerCase()}|compute-usage`
+      : (input.resourceId ?? scopeKey).toLowerCase(),
+    ...(input.activity === 'reserved_instances' ||
+    input.activity === 'savings_plans'
+      ? { alternativeGroup: scopeKey }
+      : {}),
+    ...stage,
+    mutuallyExclusiveActivities,
+  }
 }
 
 function nonProductionHeuristic(
@@ -362,24 +598,170 @@ function nonProductionHeuristic(
   return undefined
 }
 
+interface ShutdownScheduleInspection {
+  targetResourceId?: string
+  status?: string
+  taskType?: string
+  recurrence?: string
+  timeZone?: string
+  activeCoverage: boolean
+}
+
+function inspectShutdownSchedule(
+  schedule: ResourceRecord,
+): ShutdownScheduleInspection {
+  const status = firstString(schedule.properties, ['status', 'provisioningState'])
+  const enabled = !(
+    status &&
+    ['disabled', 'disable', 'deleted', 'failed', 'canceled', 'cancelled'].includes(
+      status.toLowerCase(),
+    )
+  )
+  const taskType = firstString(schedule.properties, [
+    'taskType',
+    'task',
+    'scheduleType',
+  ])
+  const shutdownTask = taskType
+    ? /shutdown|compute.*stop|stop.*compute/i.test(taskType)
+    : /shutdown/i.test(schedule.name)
+  const dailyRecurrence = asObject(schedule.properties.dailyRecurrence)
+  const recurrence =
+    firstString(dailyRecurrence, ['time']) ??
+    firstString(schedule.properties, ['recurrence', 'scheduleTime'])
+  const timeZone = firstString(schedule.properties, [
+    'timeZoneId',
+    'timeZone',
+  ])
+  const targetResourceId =
+    typeof schedule.properties.targetResourceId === 'string'
+      ? schedule.properties.targetResourceId
+      : undefined
+  return {
+    targetResourceId,
+    status,
+    taskType,
+    recurrence,
+    timeZone,
+    activeCoverage: Boolean(
+      targetResourceId &&
+        enabled &&
+        shutdownTask &&
+        recurrence &&
+        timeZone,
+    ),
+  }
+}
+
+function telemetryEvidencePoints(
+  telemetry: VmTelemetryEvidence,
+): EvidencePoint[] {
+  const metric = (name: string) =>
+    telemetry.metrics.find((item) => item.name === name)
+  const cpu = metric('Percentage CPU')
+  const networkIn = metric('Network In Total')
+  const networkOut = metric('Network Out Total')
+  const diskRead = metric('Disk Read Bytes')
+  const diskWrite = metric('Disk Write Bytes')
+  return [
+    {
+      label: 'VmAvailabilityMetric coverage',
+      value: 100 - telemetry.availability.missingDataPercentage,
+      unit: '%',
+      source: 'Azure Monitor Metrics',
+      observedAt: telemetry.collectedAt,
+    },
+    {
+      label: 'Observed available hours',
+      value: telemetry.availability.observedAvailableHours,
+      unit: 'hours',
+      source: 'Azure Monitor VmAvailabilityMetric',
+      observedAt: telemetry.collectedAt,
+    },
+    ...(telemetry.availability.knownAvailabilityPercentage !== null
+      ? [
+          {
+            label: 'Known-bucket availability',
+            value: telemetry.availability.knownAvailabilityPercentage,
+            unit: '%',
+            source: 'Azure Monitor VmAvailabilityMetric',
+            observedAt: telemetry.collectedAt,
+          },
+        ]
+      : []),
+    ...(cpu?.average !== null && cpu?.average !== undefined
+      ? [
+          {
+            label: 'Hourly average CPU',
+            value: cpu.average,
+            unit: '%',
+            source: 'Azure Monitor Percentage CPU',
+            observedAt: telemetry.collectedAt,
+          },
+        ]
+      : []),
+    ...(cpu?.percentile95 !== null && cpu?.percentile95 !== undefined
+      ? [
+          {
+            label: 'Hourly CPU p95',
+            value: cpu.percentile95,
+            unit: '%',
+            source: 'Azure Monitor Percentage CPU',
+            observedAt: telemetry.collectedAt,
+          },
+        ]
+      : []),
+    ...[
+      ['Network ingress', networkIn],
+      ['Network egress', networkOut],
+      ['Disk read', diskRead],
+      ['Disk write', diskWrite],
+    ].flatMap(([label, summary]) =>
+      typeof label === 'string' &&
+      typeof summary === 'object' &&
+      summary !== null &&
+      'total' in summary &&
+      typeof summary.total === 'number'
+        ? [
+            {
+              label: `${label} over telemetry window`,
+              value: summary.total,
+              unit: 'bytes',
+              source: 'Azure Monitor Metrics',
+              observedAt: telemetry.collectedAt,
+            },
+          ]
+        : [],
+    ),
+    {
+      label: 'Relevant Activity Log events',
+      value: telemetry.activityLog.events.length,
+      source: 'Azure Activity Log',
+      observedAt: telemetry.collectedAt,
+    },
+  ]
+}
+
 function makeRecommendation(input: {
   source: SnapshotRecommendation['source']
   sourceFamily: string
   sourceRecommendationId?: string
   category: RecommendationCategory
+  activity: SavingsActivity
   title: string
   description: string
   suggestedAction: string
   tenantId?: string
   subscription: ArmSubscription
   resource: ResourceRecord
-  savings: number
-  currentCost: number
-  currency: string
+  savings: number | null
+  currentCost: number | null
+  currency: string | null
   confidence: number
   effort: SnapshotRecommendation['effort']
   risk: SnapshotRecommendation['risk']
   evidence: EvidencePoint[]
+  claim: Omit<RecommendationClaim, 'overlap'>
   observedAt: string
 }): SnapshotRecommendation {
   const fingerprint = stableId(
@@ -392,6 +774,20 @@ function makeRecommendation(input: {
       .join('|')
       .toLowerCase(),
   )
+  const savings =
+    input.savings === null ? null : Math.max(0, input.savings)
+  const claim: RecommendationClaim = {
+    ...input.claim,
+    overlap: overlapIdentity({
+      activity: input.activity,
+      subscriptionId: input.subscription.subscriptionId,
+      resourceType: input.resource.type,
+      resourceId: input.resource.id,
+      fingerprint,
+      title: input.title,
+      evidence: input.evidence,
+    }),
+  }
   return {
     id: `rec_${fingerprint}`,
     fingerprint,
@@ -399,12 +795,7 @@ function makeRecommendation(input: {
     sourceFamily: input.sourceFamily,
     sourceRecommendationId: input.sourceRecommendationId,
     category: input.category,
-    activity: classifySavingsActivity({
-      title: input.title,
-      description: input.description,
-      category: input.category,
-      resourceType: input.resource.type,
-    }),
+    activity: input.activity,
     title: input.title,
     description: input.description,
     suggestedAction: input.suggestedAction,
@@ -416,9 +807,17 @@ function makeRecommendation(input: {
     resourceType: input.resource.type,
     resourceGroup: input.resource.resourceGroup,
     location: input.resource.location,
-    estimatedMonthlySavings: Math.max(0, input.savings),
-    currentMonthlyCost: Math.max(0, input.currentCost),
+    estimatedMonthlySavings: savings,
+    azureEstimatedMonthlySavings:
+      claim.level === 'azure_estimate' ? savings : null,
+    calculatedMonthlySavings:
+      claim.level === 'calculated_scenario' ? savings : null,
+    measuredMonthlySavings:
+      claim.level === 'measured_result' ? savings : null,
+    currentMonthlyCost:
+      input.currentCost === null ? null : Math.max(0, input.currentCost),
     currency: input.currency,
+    claim,
     confidence: input.confidence,
     confidenceBand: confidenceBand(input.confidence),
     effort: input.effort,
@@ -487,9 +886,32 @@ async function azureErrorCode(response: Response): Promise<string | undefined> {
     : undefined
 }
 
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds)
+function sleep(
+  milliseconds: number,
+  signal?: AbortSignal | null,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new Error('Azure request aborted'),
+      )
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', handleAbort)
+      resolve()
+    }, milliseconds)
+    const handleAbort = (): void => {
+      clearTimeout(timer)
+      reject(
+        signal?.reason instanceof Error
+          ? signal.reason
+          : new Error('Azure request aborted'),
+      )
+    }
+    signal?.addEventListener('abort', handleAbort, { once: true })
   })
 }
 
@@ -578,15 +1000,33 @@ export function createCostQueryPlan(
   }
 }
 
+export interface AzureProviderOptions {
+  availabilityMetricQuery?: AvailabilityMetricQuery
+  metricsClientFactory?: MetricsClientFactory
+  telemetryConcurrency?: number
+  telemetryMaximumAttempts?: number
+  telemetryTimeoutMilliseconds?: number
+  telemetryRetryDelayMilliseconds?: number
+  telemetryBatchSize?: number
+  telemetryMaximumCandidates?: number
+  now?: () => Date
+}
+
 export class AzureProvider implements ProspectorProvider {
   readonly name = 'azure'
   readonly mode = 'live' as const
   private readonly credential: TokenCredential
   private readonly requestedTenantId?: string
+  private readonly options: AzureProviderOptions
 
-  constructor(credential?: TokenCredential, requestedTenantId?: string) {
+  constructor(
+    credential?: TokenCredential,
+    requestedTenantId?: string,
+    options: AzureProviderOptions = {},
+  ) {
     this.requestedTenantId = requestedTenantId
     this.credential = credential ?? createCredential(requestedTenantId)
+    this.options = options
   }
 
   private async requestOnce<T>(
@@ -640,6 +1080,7 @@ export class AzureProvider implements ProspectorProvider {
       300_000,
     )
     for (let attempt = 0; ; attempt += 1) {
+      init.signal?.throwIfAborted()
       try {
         budget?.qpuBudget.consume(budget.qpuCost)
         return await this.requestOnce<T>(url, operation, init)
@@ -653,7 +1094,7 @@ export class AzureProvider implements ProspectorProvider {
         }
         const delay = retryDelay(error, attempt)
         if (delay > maximumRetryDelay) throw error
-        await sleep(delay)
+        await sleep(delay, init.signal)
       }
     }
   }
@@ -770,7 +1211,10 @@ export class AzureProvider implements ProspectorProvider {
             function: 'Sum',
           },
         },
-        grouping: [{ type: 'Dimension', name: 'ResourceId' }],
+        grouping: [
+          { type: 'Dimension', name: 'ResourceId' },
+          { type: 'Dimension', name: 'PricingModel' },
+        ],
       },
     })
     type CostResponse = {
@@ -817,6 +1261,9 @@ export class AzureProvider implements ProspectorProvider {
       ['usagedate', 'billingmonth', 'month'].includes(name),
     )
     const currencyIndex = columns.findIndex((name) => name === 'currency')
+    const pricingModelIndex = columns.findIndex(
+      (name) => name === 'pricingmodel',
+    )
     if (
       costIndex < 0 ||
       resourceIndex < 0 ||
@@ -828,6 +1275,10 @@ export class AzureProvider implements ProspectorProvider {
       )
     }
     const monthlyResourceCosts = new Map<string, Map<string, number>>()
+    const monthlyVariableResourceCosts = new Map<
+      string,
+      Map<string, number>
+    >()
     let currency: string | undefined
 
     for (const response of responses) {
@@ -849,6 +1300,20 @@ export class AzureProvider implements ProspectorProvider {
         const periodCosts = monthlyResourceCosts.get(period) ?? new Map()
         periodCosts.set(resourceId, (periodCosts.get(resourceId) ?? 0) + cost)
         monthlyResourceCosts.set(period, periodCosts)
+        const pricingModel =
+          pricingModelIndex >= 0 &&
+          typeof row[pricingModelIndex] === 'string'
+            ? row[pricingModelIndex].toLowerCase().replaceAll(/[\s_-]/g, '')
+            : ''
+        if (['ondemand', 'spot'].includes(pricingModel)) {
+          const variableCosts =
+            monthlyVariableResourceCosts.get(period) ?? new Map()
+          variableCosts.set(
+            resourceId,
+            (variableCosts.get(resourceId) ?? 0) + cost,
+          )
+          monthlyVariableResourceCosts.set(period, variableCosts)
+        }
       }
     }
 
@@ -882,6 +1347,23 @@ export class AzureProvider implements ProspectorProvider {
         ),
       ]),
     )
+    const representativeVariableByResource = new Map(
+      [...resourceIds]
+        .map(
+          (resourceId): [string, number] => [
+            resourceId,
+            median(
+              trendPeriods.map(
+                (period) =>
+                  monthlyVariableResourceCosts
+                    .get(period)
+                    ?.get(resourceId) ?? 0,
+              ),
+            ),
+          ],
+        )
+        .filter(([, cost]) => cost > 0),
+    )
     if (
       !currency &&
       [...monthlyTotals.values()].some((monthlyCost) => monthlyCost !== 0)
@@ -894,13 +1376,117 @@ export class AzureProvider implements ProspectorProvider {
       subscriptionId: subscription.subscriptionId,
       currency,
       representativeByResource,
+      representativeVariableByResource,
       monthlyTotals,
       representativeTotal: median([...monthlyTotals.values()]),
     }
   }
 
+  private async queryVmAvailabilityMetric(
+    candidate: VmTelemetryCandidate,
+    window: ReturnType<typeof completedThirtyDayWindow>,
+    abortSignal: AbortSignal,
+  ): Promise<Metric | undefined> {
+    const parameters = new URLSearchParams({
+      'api-version': METRICS_API_VERSION,
+      metricnames: 'VmAvailabilityMetric',
+      metricnamespace: 'Microsoft.Compute/virtualMachines',
+      timespan: `${window.startAt}/${window.endAt}`,
+      interval: 'PT1H',
+      aggregation: 'Average,Minimum,Maximum',
+    })
+    const response: { value?: unknown[] } = await this.request(
+      `${ARM_ORIGIN}${candidate.resourceId}/providers/Microsoft.Insights/metrics?${parameters}`,
+      'VM availability metric query',
+      { signal: abortSignal },
+    )
+    return (response.value ?? [])
+      .map(resourceScopedMetric)
+      .find(
+        (metric): metric is Metric =>
+          metric?.name.toLowerCase() === 'vmavailabilitymetric',
+      )
+  }
+
+  private async queryVmActivityLog(
+    candidate: VmTelemetryCandidate,
+    window: ReturnType<typeof completedThirtyDayWindow>,
+    abortSignal: AbortSignal,
+  ): Promise<ActivityLogQueryResult> {
+    const inclusiveEnd = new Date(
+      new Date(window.endAt).getTime() - 1,
+    ).toISOString()
+    const filter = [
+      `eventTimestamp ge '${window.startAt}'`,
+      `eventTimestamp le '${inclusiveEnd}'`,
+      `resourceUri eq '${candidate.resourceId.replaceAll("'", "''")}'`,
+    ].join(' and ')
+    const parameters = new URLSearchParams({
+      'api-version': ACTIVITY_LOG_API_VERSION,
+      $filter: filter,
+    })
+    let nextUrl: string | undefined =
+      `${ARM_ORIGIN}/subscriptions/${encodeURIComponent(
+        candidate.subscriptionId,
+      )}/providers/microsoft.insights/eventtypes/management/values?${parameters}`
+    const events: VmActivityLogEvent[] = []
+    for (let page = 0; nextUrl && page < 10; page += 1) {
+      const response: {
+        value?: Array<Record<string, unknown>>
+        nextLink?: string
+      } = await this.request(nextUrl, 'VM Activity Log query', {
+        signal: abortSignal,
+      })
+      for (const row of response.value ?? []) {
+        const operationObject = asObject(row.operationName)
+        const statusObject = asObject(row.status)
+        const operation =
+          firstString(operationObject, ['value', 'localizedValue']) ??
+          (typeof row.operationName === 'string'
+            ? row.operationName
+            : undefined)
+        const timestamp =
+          typeof row.eventTimestamp === 'string'
+            ? row.eventTimestamp
+            : undefined
+        if (
+          !operation ||
+          !timestamp ||
+          !/microsoft\.compute\/virtualmachines\/(?:start|restart|poweroff|deallocate)\/action/i.test(
+            operation,
+          )
+        ) {
+          continue
+        }
+        events.push({
+          operation,
+          status:
+            firstString(statusObject, ['value', 'localizedValue']) ??
+            (typeof row.status === 'string' ? row.status : 'Unknown'),
+          timestamp,
+          ...(typeof row.correlationId === 'string'
+            ? { correlationId: row.correlationId }
+            : {}),
+        })
+      }
+      nextUrl = response.nextLink
+    }
+    return {
+      events: events.sort((left, right) =>
+        left.timestamp.localeCompare(right.timestamp),
+      ),
+      ...(nextUrl
+        ? {
+            error:
+              'Activity Log pagination exceeded the 10-page per-resource safety bound.',
+          }
+        : {}),
+    }
+  }
+
   async collect(request: ProviderCollectRequest): Promise<ProviderSnapshot> {
-    const collectedAt = new Date().toISOString()
+    const collectionNow = this.options.now?.() ?? new Date()
+    const collectedAt = collectionNow.toISOString()
     const warnings: string[] = []
     const completeSourceFamilies: string[] = []
     const requestedTenantId =
@@ -1038,11 +1624,14 @@ export class AzureProvider implements ProspectorProvider {
           result.currency.trim().toUpperCase(),
         ]),
     )
-    const fallbackCurrency = billingCurrencies[0] ?? 'USD'
     const allResourceCosts = new Map<string, number>()
+    const allVariableResourceCosts = new Map<string, number>()
     for (const result of costResults) {
       for (const [resourceId, cost] of result.representativeByResource) {
         allResourceCosts.set(resourceId, cost)
+      }
+      for (const [resourceId, cost] of result.representativeVariableByResource) {
+        allVariableResourceCosts.set(resourceId, cost)
       }
     }
     const graphResults = new Map<string, unknown[]>()
@@ -1054,6 +1643,7 @@ export class AzureProvider implements ProspectorProvider {
           advisorresources
           | where type =~ 'microsoft.advisor/recommendations'
           | where tostring(properties.category) =~ 'Cost'
+          | where tostring(properties.recommendationStatus) in~ ('New', 'Active', 'InProgress')
           | extend advisorResourceId=id,
               impactedResourceId=tostring(properties.resourceMetadata.resourceId),
               advisorRecommendationId=name
@@ -1085,7 +1675,17 @@ export class AzureProvider implements ProspectorProvider {
               ),
               subscriptionId, resourceGroup=impactedResourceGroup,
               location=impactedLocation, tags=impactedTags, properties,
-              advisorRecommendationId
+              advisorRecommendationId, advisorResourceId
+        `,
+      },
+      {
+        key: 'advisorConfigurations',
+        operation: 'Advisor configuration query',
+        query: `
+          advisorresources
+          | where type =~ 'microsoft.advisor/configurations'
+          | project id, name, type, subscriptionId, resourceGroup,
+              location, tags, properties
         `,
       },
       {
@@ -1174,9 +1774,58 @@ export class AzureProvider implements ProspectorProvider {
     }
 
     const recommendations: SnapshotRecommendation[] = []
+    let vmTelemetryCandidateCount = 0
+    let vmTelemetrySelectedCount = 0
+    let vmTelemetryRetrievedCount = 0
+    let vmTelemetrySufficientCount = 0
     const tenantId =
       requestedTenantId ??
       subscriptions.find((subscription) => subscription.tenantId)?.tenantId
+
+    const excludedAdvisorSubscriptions = new Set<string>()
+    const excludedAdvisorResourceGroups = new Set<string>()
+    const advisorLowCpuConfigurations = new Map<
+      string,
+      {
+        lowCpuThreshold: number
+        resourceId?: string
+      }
+    >()
+    for (const value of graphResults.get('advisorConfigurations') ?? []) {
+      const configuration = asObject(value)
+      const properties = asObject(configuration.properties)
+      const excluded =
+        properties.exclude === true ||
+        (typeof properties.exclude === 'string' &&
+          properties.exclude.toLowerCase() === 'true')
+      const subscriptionId =
+        typeof configuration.subscriptionId === 'string'
+          ? configuration.subscriptionId.toLowerCase()
+          : ''
+      const resourceGroup =
+        typeof configuration.resourceGroup === 'string'
+          ? configuration.resourceGroup.toLowerCase()
+          : ''
+      if (!subscriptionId) continue
+      const lowCpuThreshold = firstNumber(properties, ['lowCpuThreshold'])
+      if (!resourceGroup && lowCpuThreshold !== undefined) {
+        advisorLowCpuConfigurations.set(subscriptionId, {
+          lowCpuThreshold,
+          ...(typeof configuration.id === 'string'
+            ? { resourceId: configuration.id }
+            : {}),
+        })
+      }
+      if (excluded) {
+        if (resourceGroup) {
+          excludedAdvisorResourceGroups.add(
+            `${subscriptionId}|${resourceGroup}`,
+          )
+        } else {
+          excludedAdvisorSubscriptions.add(subscriptionId)
+        }
+      }
+    }
 
     const advisorRows = graphResults.get('advisor')
     if (advisorRows) {
@@ -1190,6 +1839,21 @@ export class AzureProvider implements ProspectorProvider {
         )
         if (!subscription) continue
         const properties = resource.properties
+        const nativeStatus = normalizedAdvisorStatus(properties)
+        if (!isActiveAdvisorRecommendation(properties)) continue
+        if (properties.tracked === true) continue
+        const exclusionKey =
+          `${resource.subscriptionId.toLowerCase()}|${(
+            resource.resourceGroup ?? ''
+          ).toLowerCase()}`
+        if (
+          excludedAdvisorSubscriptions.has(
+            resource.subscriptionId.toLowerCase(),
+          ) ||
+          excludedAdvisorResourceGroups.has(exclusionKey)
+        ) {
+          continue
+        }
         const resourceMetadata = asObject(properties.resourceMetadata)
         const impactedResourceId =
           typeof resourceMetadata.resourceId === 'string'
@@ -1210,16 +1874,44 @@ export class AzureProvider implements ProspectorProvider {
         }
         const shortDescription = asObject(properties.shortDescription)
         const extended = asObject(properties.extendedProperties)
+        const recommendationTypeId = firstString(properties, [
+          'recommendationTypeId',
+        ])
+        const normalizedRecommendationTypeId =
+          recommendationTypeId?.toLowerCase()
+        const inactiveVmConfiguration =
+          normalizedRecommendationTypeId &&
+          ADVISOR_INACTIVE_VM_TYPE_IDS.has(normalizedRecommendationTypeId)
+            ? advisorLowCpuConfigurations.get(
+                resource.subscriptionId.toLowerCase(),
+              )
+            : undefined
+        const maxCpuP95 = firstNumber(extended, ['MaxCpuP95'])
+        if (
+          normalizedRecommendationTypeId &&
+          ADVISOR_INACTIVE_VM_TYPE_IDS.has(
+            normalizedRecommendationTypeId,
+          )
+        ) {
+          const passesLowCpuConfiguration =
+            inactiveVmConfiguration && maxCpuP95 !== undefined
+              ? maxCpuP95 < inactiveVmConfiguration.lowCpuThreshold
+              : maxCpuP95 === undefined || maxCpuP95 < 100
+          if (!passesLowCpuConfiguration) continue
+        }
         const annualSavings = firstNumber(extended, [
           'annualSavingsAmount',
           'annualSavings',
         ])
-        const monthlySavings =
+        const rawMonthlySavings =
           firstNumber(extended, [
             'monthlySavingsAmount',
             'savingsAmount',
             'estimatedMonthlySavings',
-          ]) ?? (annualSavings !== undefined ? annualSavings / 12 : 0)
+          ])
+        const monthlySavings =
+          rawMonthlySavings ??
+          (annualSavings !== undefined ? annualSavings / 12 : null)
         const currentCost = resourceCost(impactedResourceId, allResourceCosts)
         const costCurrency = costBySubscription
           .get(resource.subscriptionId.toLowerCase())
@@ -1240,18 +1932,7 @@ export class AzureProvider implements ProspectorProvider {
             `Azure Advisor savings for ${subscription.displayName}/${resource.name} use ${advisorCurrency}, while Cost Management uses ${costCurrency}; both source amounts are retained without combining them.`,
           )
         }
-        const recommendationCurrency =
-          advisorCurrency ?? costCurrency ?? fallbackCurrency
-        if (
-          advisorCurrency &&
-          !currencyBySubscription.has(resource.subscriptionId.toLowerCase())
-        ) {
-          currencyBySubscription.set(
-            resource.subscriptionId.toLowerCase(),
-            advisorCurrency,
-          )
-        }
-        const comparableCurrentCost = currenciesConflict ? 0 : currentCost
+        const comparableCurrentCost = currenciesConflict ? null : currentCost
         const term = formatCommitmentTerm(
           firstString(extended, ['term']),
         )
@@ -1267,10 +1948,23 @@ export class AzureProvider implements ProspectorProvider {
           'displaySKU',
         ])
         const recommendationRegion = firstString(extended, ['region'])
+        const recommendationCurrency =
+          advisorCurrency ?? costCurrency ?? null
+        if (monthlySavings !== null && monthlySavings > 0 && !recommendationCurrency) {
+          warnings.push(
+            `Azure Advisor savings for ${subscription.displayName}/${resource.name} have no source currency and were retained as non-monetary evidence.`,
+          )
+        }
+        const hasMonetaryEstimate =
+          monthlySavings !== null &&
+          monthlySavings > 0 &&
+          recommendationCurrency !== null
         const confidence =
-          monthlySavings > 0 && comparableCurrentCost > 0
+          hasMonetaryEstimate &&
+          comparableCurrentCost !== null &&
+          comparableCurrentCost > 0
             ? 0.9
-            : monthlySavings > 0
+            : hasMonetaryEstimate
               ? 0.78
               : 0.62
         const baseTitle =
@@ -1290,6 +1984,43 @@ export class AzureProvider implements ProspectorProvider {
         const title = scenario.length
           ? `${baseTitle} (${scenario.join(', ')})`
           : baseTitle
+        const classification = classifyAdvisorSavingsActivity({
+          recommendationTypeId,
+          title,
+          description: problem,
+          category: categoryForAdvisor(
+            impactedResource.type,
+            title,
+            problem,
+          ),
+          resourceType: impactedResource.type,
+        })
+        const nativeLastUpdatedAt = firstString(properties, [
+          'lastUpdated',
+          'lastUpdatedAt',
+        ])
+        const nativeImpact = firstString(properties, ['impact'])
+        const nativeRisk =
+          firstString(properties, ['risk']) ??
+          firstString(extended, ['risk'])
+        const lookbackDays = finiteNumber(lookbackPeriod)
+        const missingEvidence = [
+          ...(comparableCurrentCost === null
+            ? ['Independent resource-level cost baseline']
+            : []),
+          ...(!recommendationCurrency ? ['Savings currency'] : []),
+          ...(!nativeStatus ? ['Authoritative Advisor lifecycle status'] : []),
+          ...(!nativeLastUpdatedAt ? ['Advisor last-updated timestamp'] : []),
+          ...(!lookbackDays ? ['Advisor usage lookback window'] : []),
+          ...(normalizedRecommendationTypeId &&
+          ADVISOR_INACTIVE_VM_TYPE_IDS.has(normalizedRecommendationTypeId) &&
+          maxCpuP95 === undefined
+            ? ['Advisor MaxCpuP95 used by the inactive-VM configuration rule']
+            : []),
+          ...(!graphResults.has('advisorConfigurations')
+            ? ['Advisor exclusion configuration']
+            : []),
+        ]
         recommendations.push(
           makeRecommendation({
             source: 'advisor',
@@ -1303,13 +2034,14 @@ export class AzureProvider implements ProspectorProvider {
               title,
               problem,
             ),
+            activity: classification.activity,
             title,
             description: problem,
             suggestedAction: title,
             tenantId,
             subscription,
             resource: impactedResource,
-            savings: monthlySavings,
+            savings: hasMonetaryEstimate ? monthlySavings : null,
             currentCost: comparableCurrentCost,
             currency: recommendationCurrency,
             confidence,
@@ -1325,12 +2057,14 @@ export class AzureProvider implements ProspectorProvider {
                 source: 'Azure Advisor',
                 observedAt: collectedAt,
               },
-              ...(monthlySavings > 0
+              ...(monthlySavings !== null && monthlySavings > 0
                 ? [
                     {
                       label: 'Estimated monthly savings',
                       value: monthlySavings,
-                      unit: recommendationCurrency,
+                      ...(recommendationCurrency
+                        ? { unit: recommendationCurrency }
+                        : {}),
                       source: 'Azure Advisor',
                       observedAt: collectedAt,
                     },
@@ -1341,8 +2075,21 @@ export class AzureProvider implements ProspectorProvider {
                     {
                       label: 'Estimated annual savings',
                       value: annualSavings,
-                      unit: recommendationCurrency,
+                      ...(recommendationCurrency
+                        ? { unit: recommendationCurrency }
+                        : {}),
                       source: 'Azure Advisor',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(comparableCurrentCost !== null && costCurrency
+                ? [
+                    {
+                      label: 'Median completed-month amortized cost',
+                      value: comparableCurrentCost,
+                      unit: costCurrency,
+                      source: 'Cost Management',
                       observedAt: collectedAt,
                     },
                   ]
@@ -1398,6 +2145,99 @@ export class AzureProvider implements ProspectorProvider {
                   ]
                 : []),
             ],
+            claim: {
+              level: hasMonetaryEstimate
+                ? 'azure_estimate'
+                : 'investigation_lead',
+              decisionStatus: hasMonetaryEstimate
+                ? 'needs_validation'
+                : 'needs_evidence',
+              validationState: hasMonetaryEstimate
+                ? 'azure_authored'
+                : 'unvalidated',
+              ruleVersion: ADVISOR_RULE_VERSION,
+              provenance: {
+                provider: this.name,
+                sourceFamily: 'azure:advisor-cost',
+                sourceApi: 'Azure Advisor via Azure Resource Graph',
+                sourceApiVersion: RESOURCE_GRAPH_API_VERSION,
+                collectedAt,
+                nativeRecommendationId:
+                  typeof advisorRow.advisorRecommendationId === 'string'
+                    ? advisorRow.advisorRecommendationId
+                    : resource.name,
+                nativeRecommendationResourceId:
+                  typeof advisorRow.advisorResourceId === 'string'
+                    ? advisorRow.advisorResourceId
+                    : undefined,
+                nativeRecommendationTypeId: recommendationTypeId,
+                nativeStatus,
+                nativeLastUpdatedAt,
+                nativeImpact,
+                nativeRisk,
+                nativeLookbackDays: lookbackDays,
+                activityClassification: classification.method,
+                extendedProperties: scalarExtendedProperties(extended),
+                ...(inactiveVmConfiguration
+                  ? {
+                      advisorConfiguration: {
+                        source: 'Azure Advisor configuration' as const,
+                        scope: resource.subscriptionId,
+                        resourceId: inactiveVmConfiguration.resourceId,
+                        lowCpuThreshold:
+                          inactiveVmConfiguration.lowCpuThreshold,
+                      },
+                    }
+                  : {}),
+              },
+              evidenceWindow: lookbackDays
+                ? {
+                    lookbackDays,
+                    description: `Azure Advisor usage lookback of ${lookbackDays} days`,
+                  }
+                : {
+                    endAt: collectedAt,
+                    description:
+                      'Point-in-time Advisor recommendation; source lookback was not supplied.',
+                  },
+              ...(hasMonetaryEstimate
+                ? {
+                    formula: {
+                      expression:
+                        rawMonthlySavings !== undefined
+                          ? 'azure_advisor_monthly_savings'
+                          : 'annual_savings / 12',
+                      inputs: [
+                        rawMonthlySavings !== undefined
+                          ? {
+                              name: 'azure_advisor_monthly_savings',
+                              value: rawMonthlySavings,
+                              unit: recommendationCurrency,
+                              sourceEvidenceLabel:
+                                'Estimated monthly savings',
+                            }
+                          : {
+                              name: 'annual_savings',
+                              value: annualSavings ?? 0,
+                              unit: recommendationCurrency,
+                              sourceEvidenceLabel:
+                                'Estimated annual savings',
+                            },
+                      ],
+                      assumptions: [
+                        rawMonthlySavings !== undefined
+                          ? 'The amount and monthly period are authored by Azure Advisor.'
+                          : 'Azure annual estimate is distributed evenly across twelve months.',
+                      ],
+                      exclusions: [
+                        'No independent validation of the Azure-authored forecast.',
+                      ],
+                      ruleVersion: ADVISOR_RULE_VERSION,
+                    },
+                  }
+                : {}),
+              missingEvidence,
+            },
             observedAt: collectedAt,
           }),
         )
@@ -1444,23 +2284,26 @@ export class AzureProvider implements ProspectorProvider {
         const currency =
           currencyBySubscription.get(
             resource.subscriptionId.toLowerCase(),
-          ) ?? fallbackCurrency
+          ) ?? null
         const currentCost = resourceCost(resource.id, allResourceCosts)
+        const quantified =
+          currentCost !== null && currentCost > 0 && currency !== null
         recommendations.push(
           makeRecommendation({
             source: 'resource_graph',
             sourceFamily: 'azure:resource-orphans',
             category: categoryForResource(resource.type),
+            activity: 'orphan_cleanup',
             title: input.title,
             description: input.description,
             suggestedAction: input.action,
             tenantId,
             subscription,
             resource,
-            savings: currentCost,
+            savings: quantified ? currentCost : null,
             currentCost,
             currency,
-            confidence: currentCost > 0 ? 0.96 : 0.82,
+            confidence: quantified ? 0.96 : 0.82,
             effort: 'low',
             risk: 'medium',
             evidence: [
@@ -1470,7 +2313,7 @@ export class AzureProvider implements ProspectorProvider {
                 source: 'Azure Resource Graph',
                 observedAt: collectedAt,
               },
-              ...(currentCost > 0
+              ...(quantified
                 ? [
                     {
                       label: 'Median completed-month amortized cost',
@@ -1482,6 +2325,60 @@ export class AzureProvider implements ProspectorProvider {
                   ]
                 : []),
             ],
+            claim: {
+              level: quantified ? 'calculated_scenario' : 'observed_fact',
+              decisionStatus: 'needs_validation',
+              validationState: quantified
+                ? 'deterministic_calculation'
+                : 'independently_validated',
+              ruleVersion: ORPHAN_RULE_VERSION,
+              provenance: {
+                provider: this.name,
+                sourceFamily: 'azure:resource-orphans',
+                sourceApi: 'Azure Resource Graph',
+                sourceApiVersion: RESOURCE_GRAPH_API_VERSION,
+                collectedAt,
+                activityClassification: 'deterministic_rule',
+                extendedProperties: {},
+              },
+              evidenceWindow: {
+                endAt: collectedAt,
+                description:
+                  'Point-in-time resource relationship with a completed-month median cost baseline.',
+              },
+              ...(quantified
+                ? {
+                    formula: {
+                      expression: 'avoidable_monthly_cost = median_resource_cost',
+                      inputs: [
+                        {
+                          name: 'median_resource_cost',
+                          value: currentCost,
+                          unit: currency,
+                          sourceEvidenceLabel:
+                            'Median completed-month amortized cost',
+                        },
+                      ],
+                      assumptions: [
+                        'Deleting the resource removes all resource-attributed variable cost.',
+                        'The current unattached relationship persists after validation.',
+                      ],
+                      exclusions: [
+                        'Reservation or commitment reallocation effects.',
+                        'Retention, recovery, deployment and external dependency requirements.',
+                      ],
+                      ruleVersion: ORPHAN_RULE_VERSION,
+                    },
+                  }
+                : {}),
+              missingEvidence: [
+                'Resource age and duration in the unattached state',
+                'External deployment, DNS and recovery dependencies',
+                ...(quantified
+                  ? []
+                  : ['Native-currency resource-level cost baseline']),
+              ],
+            },
             observedAt: collectedAt,
           }),
         )
@@ -1493,14 +2390,20 @@ export class AzureProvider implements ProspectorProvider {
     if (vmRows && scheduleRows) {
       completeSourceFamilies.push('azure:auto-shutdown-coverage')
       const scheduledTargets = new Set<string>()
+      const scheduleInspections = new Map<
+        string,
+        ShutdownScheduleInspection[]
+      >()
       for (const value of scheduleRows) {
         const schedule = resourceRecord(value)
         if (!schedule) continue
-        const target =
-          typeof schedule.properties.targetResourceId === 'string'
-            ? schedule.properties.targetResourceId
-            : undefined
-        if (target) scheduledTargets.add(target.toLowerCase())
+        const inspection = inspectShutdownSchedule(schedule)
+        if (!inspection.targetResourceId) continue
+        const target = inspection.targetResourceId.toLowerCase()
+        const inspections = scheduleInspections.get(target) ?? []
+        inspections.push(inspection)
+        scheduleInspections.set(target, inspections)
+        if (inspection.activeCoverage) scheduledTargets.add(target)
       }
       for (const value of vmRows) {
         const resource = resourceRecord(value)
@@ -1516,13 +2419,20 @@ export class AzureProvider implements ProspectorProvider {
         const currency =
           currencyBySubscription.get(
             resource.subscriptionId.toLowerCase(),
-          ) ?? fallbackCurrency
+          ) ?? null
         const currentCost = resourceCost(resource.id, allResourceCosts)
+        const eligibleVariableCost = resourceCost(
+          resource.id,
+          allVariableResourceCosts,
+        )
+        const inspectedSchedules =
+          scheduleInspections.get(resource.id.toLowerCase()) ?? []
         recommendations.push(
           makeRecommendation({
             source: 'prospector',
             sourceFamily: 'azure:auto-shutdown-coverage',
             category: 'scheduling',
+            activity: 'shutdown_scheduling',
             title: 'Review VM auto-shutdown coverage',
             description:
               'No matching DevTest Lab auto-shutdown schedule was found. Workload operating hours are unknown, so this is a low-confidence lead.',
@@ -1531,7 +2441,7 @@ export class AzureProvider implements ProspectorProvider {
             tenantId,
             subscription,
             resource,
-            savings: currentCost * 0.5,
+            savings: null,
             currentCost,
             currency,
             confidence: 0.45,
@@ -1550,10 +2460,317 @@ export class AzureProvider implements ProspectorProvider {
                 source: 'Resource name or generic environment tag',
                 observedAt: collectedAt,
               },
+              ...(inspectedSchedules.length
+                ? [
+                    {
+                      label: 'Matching schedule records inspected',
+                      value: JSON.stringify(
+                        inspectedSchedules.map((inspection) => ({
+                          status: inspection.status ?? 'unknown',
+                          taskType: inspection.taskType ?? 'unknown',
+                          recurrence: inspection.recurrence ?? 'missing',
+                          timeZone: inspection.timeZone ?? 'missing',
+                          activeCoverage: inspection.activeCoverage,
+                        })),
+                      ),
+                      source: 'Azure Resource Graph',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(currentCost !== null && currency !== null
+                ? [
+                    {
+                      label: 'Median completed-month amortized cost',
+                      value: currentCost,
+                      unit: currency,
+                      source: 'Cost Management',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
+              ...(eligibleVariableCost !== null && currency !== null
+                ? [
+                    {
+                      label: 'Eligible variable VM compute cost',
+                      value: eligibleVariableCost,
+                      unit: currency,
+                      source:
+                        'Cost Management PricingModel=OnDemand or Spot',
+                      observedAt: collectedAt,
+                    },
+                  ]
+                : []),
             ],
+            claim: {
+              level: 'investigation_lead',
+              decisionStatus: 'needs_evidence',
+              validationState: 'unvalidated',
+              ruleVersion: SCHEDULE_RULE_VERSION,
+              provenance: {
+                provider: this.name,
+                sourceFamily: 'azure:auto-shutdown-coverage',
+                sourceApi: 'Azure Resource Graph',
+                sourceApiVersion: RESOURCE_GRAPH_API_VERSION,
+                collectedAt,
+                activityClassification: 'deterministic_rule',
+                extendedProperties: {},
+              },
+              evidenceWindow: {
+                endAt: collectedAt,
+                description:
+                  'Point-in-time DevTest Lab schedule inventory; no runtime history was collected.',
+              },
+              missingEvidence: [
+                'Historical VM running and deallocated state',
+                'Required operating hours and time zone',
+                'CPU, memory, disk and network utilization over a representative window',
+                'Azure Automation, Logic Apps, Functions and external scheduler coverage',
+                'Variable compute cost separated from fixed disks, IPs and commitments',
+              ],
+            },
             observedAt: collectedAt,
           }),
         )
+      }
+    }
+
+    const vmCandidateRecommendations = recommendations
+      .filter(
+        (recommendation) =>
+          recommendation.resourceId &&
+          recommendation.location &&
+          recommendation.resourceType.toLowerCase() ===
+            'microsoft.compute/virtualmachines' &&
+          ['right_sizing', 'shutdown_scheduling'].includes(
+            recommendation.activity,
+          ),
+      )
+      .sort((left, right) =>
+        left.activity === right.activity
+          ? left.resourceId!.localeCompare(right.resourceId!)
+          : left.activity === 'shutdown_scheduling'
+            ? -1
+            : 1,
+      )
+    const uniqueVmCandidates = new Map<string, VmTelemetryCandidate>()
+    for (const recommendation of vmCandidateRecommendations) {
+      const resourceId = recommendation.resourceId!
+      if (uniqueVmCandidates.has(resourceId.toLowerCase())) continue
+      uniqueVmCandidates.set(resourceId.toLowerCase(), {
+        resourceId,
+        subscriptionId: recommendation.subscriptionId,
+        location: recommendation.location!,
+      })
+    }
+    vmTelemetryCandidateCount = uniqueVmCandidates.size
+    const maximumTelemetryCandidates = Math.floor(
+      this.options.telemetryMaximumCandidates ??
+        numericEnvironmentValue(
+          'AZURE_VM_TELEMETRY_MAX_CANDIDATES',
+          50,
+          1,
+          200,
+        ),
+    )
+    const selectedVmCandidates = [...uniqueVmCandidates.values()].slice(
+      0,
+      maximumTelemetryCandidates,
+    )
+    vmTelemetrySelectedCount = selectedVmCandidates.length
+    if (vmTelemetrySelectedCount < vmTelemetryCandidateCount) {
+      warnings.push(
+        `Azure Monitor VM telemetry was limited to ${vmTelemetrySelectedCount} of ${vmTelemetryCandidateCount} evidence-relevant candidates.`,
+      )
+    }
+    if (selectedVmCandidates.length) {
+      const telemetryWindow = completedThirtyDayWindow(collectionNow)
+      const vmTelemetry = await collectVmTelemetry({
+        credential: this.credential,
+        candidates: selectedVmCandidates,
+        availabilityMetricQuery:
+          this.options.availabilityMetricQuery ??
+          ((candidate, window, abortSignal) =>
+            this.queryVmAvailabilityMetric(
+              candidate,
+              window,
+              abortSignal,
+            )),
+        activityLogQuery: (candidate, window, abortSignal) =>
+          this.queryVmActivityLog(candidate, window, abortSignal),
+        collectedAt,
+        window: telemetryWindow,
+        metricsClientFactory: this.options.metricsClientFactory,
+        concurrency:
+          this.options.telemetryConcurrency ??
+          numericEnvironmentValue(
+            'AZURE_VM_TELEMETRY_CONCURRENCY',
+            3,
+            1,
+            8,
+          ),
+        maximumAttempts:
+          this.options.telemetryMaximumAttempts ??
+          numericEnvironmentValue(
+            'AZURE_VM_TELEMETRY_MAX_ATTEMPTS',
+            2,
+            1,
+            3,
+          ),
+        timeoutMilliseconds:
+          this.options.telemetryTimeoutMilliseconds ??
+          numericEnvironmentValue(
+            'AZURE_VM_TELEMETRY_TIMEOUT_MS',
+            20_000,
+            1_000,
+            120_000,
+          ),
+        retryDelayMilliseconds:
+          this.options.telemetryRetryDelayMilliseconds ??
+          numericEnvironmentValue(
+            'AZURE_VM_TELEMETRY_RETRY_DELAY_MS',
+            500,
+            0,
+            10_000,
+          ),
+        batchSize:
+          this.options.telemetryBatchSize ??
+          numericEnvironmentValue(
+            'AZURE_VM_TELEMETRY_BATCH_SIZE',
+            20,
+            1,
+            50,
+          ),
+      })
+      vmTelemetryRetrievedCount = [...vmTelemetry.values()].filter(
+        (telemetry) => telemetry.availability.populatedBuckets > 0,
+      ).length
+      vmTelemetrySufficientCount = [...vmTelemetry.values()].filter(
+        (telemetry) =>
+          telemetry.availability.populatedBuckets /
+            telemetry.availability.expectedBuckets >=
+          VM_SCHEDULE_MINIMUM_COVERAGE,
+      ).length
+      if (vmTelemetryRetrievedCount < vmTelemetrySelectedCount) {
+        warnings.push(
+          `Azure Monitor availability data was unavailable for ${
+            vmTelemetrySelectedCount - vmTelemetryRetrievedCount
+          } of ${vmTelemetrySelectedCount} selected VM candidates; per-resource retrieval errors were retained.`,
+        )
+      }
+
+      for (const recommendation of vmCandidateRecommendations) {
+        if (!recommendation.resourceId) continue
+        const telemetry = vmTelemetry.get(
+          recommendation.resourceId.toLowerCase(),
+        )
+        if (!telemetry) continue
+        recommendation.vmTelemetry = telemetry
+        recommendation.evidence.push(...telemetryEvidencePoints(telemetry))
+        const guestMemoryGap =
+          'Guest memory telemetry is not collected; Azure Monitor Agent and Log Analytics are optional.'
+        if (recommendation.activity === 'right_sizing') {
+          recommendation.claim = {
+            ...recommendation.claim,
+            missingEvidence: [
+              ...new Set([
+                ...recommendation.claim.missingEvidence,
+                guestMemoryGap,
+                ...(telemetry.availability.populatedBuckets === 0
+                  ? ['Azure Monitor platform telemetry for this VM']
+                  : []),
+              ]),
+            ],
+          }
+          continue
+        }
+
+        const scenario = evaluateVmScheduleScenario({
+          telemetry,
+          eligibleVariableMonthlyCost: resourceCost(
+            recommendation.resourceId,
+            allVariableResourceCosts,
+          ),
+          currency: recommendation.currency,
+        })
+        recommendation.evidence.push({
+          label: 'Eight-hours-per-weekday scenario eligibility',
+          value: scenario.reason,
+          source: 'Prospector deterministic rule',
+          observedAt: collectedAt,
+        })
+        recommendation.claim = {
+          ...recommendation.claim,
+          evidenceWindow: {
+            startAt: telemetry.window.startAt,
+            endAt: telemetry.window.endAt,
+            lookbackDays: 30,
+            description:
+              'Completed 30-day Azure Monitor platform-metrics window at hourly granularity.',
+          },
+          provenance: {
+            ...recommendation.claim.provenance,
+            sourceApi:
+              'Azure Resource Graph, Azure Monitor Metrics and Azure Activity Log',
+            extendedProperties: {
+              ...recommendation.claim.provenance.extendedProperties,
+              telemetryInterval: telemetry.window.interval,
+              telemetryExpectedBuckets: telemetry.window.expectedBuckets,
+            },
+          },
+          missingEvidence: [
+            ...new Set([
+              ...recommendation.claim.missingEvidence.filter(
+                (item) =>
+                  item !== 'Historical VM running and deallocated state' &&
+                  item !==
+                    'CPU, memory, disk and network utilization over a representative window' &&
+                  (!scenario.eligible ||
+                    item !==
+                      'Variable compute cost separated from fixed disks, IPs and commitments'),
+              ),
+              guestMemoryGap,
+              'Seasonal representativeness beyond the completed 30-day window',
+              ...(scenario.eligible
+                ? []
+                : ['Sufficient near-continuous VmAvailabilityMetric evidence']),
+            ]),
+          ],
+        }
+        if (
+          !scenario.eligible ||
+          scenario.estimatedMonthlySavings === null ||
+          !scenario.formula
+        ) {
+          continue
+        }
+        recommendation.estimatedMonthlySavings =
+          scenario.estimatedMonthlySavings
+        recommendation.azureEstimatedMonthlySavings = null
+        recommendation.calculatedMonthlySavings =
+          scenario.estimatedMonthlySavings
+        recommendation.measuredMonthlySavings = null
+        recommendation.confidence = 0.72
+        recommendation.confidenceBand = confidenceBand(
+          recommendation.confidence,
+        )
+        recommendation.description =
+          'No active DevTest Lab shutdown schedule was found. A completed 30-day platform-metrics window showed near-continuous availability; the monetary value is an eight-hours-per-weekday calculated scenario that requires workload validation.'
+        recommendation.claim = {
+          ...recommendation.claim,
+          level: 'calculated_scenario',
+          decisionStatus: 'needs_validation',
+          validationState: 'deterministic_calculation',
+          ruleVersion: scenario.formula.ruleVersion,
+          formula: scenario.formula,
+        }
+        recommendation.evidence.push({
+          label: 'Eight-hours-per-weekday calculated scenario',
+          value: scenario.estimatedMonthlySavings,
+          unit: recommendation.currency!,
+          source: 'Prospector deterministic formula',
+          observedAt: collectedAt,
+        })
       }
     }
 
@@ -1577,31 +2794,50 @@ export class AzureProvider implements ProspectorProvider {
       existing.push(item)
       recommendationsBySubscription.set(key, existing)
     }
+    const supportedRecommendations =
+      selectSupportedOpportunityRecommendations(recommendations)
+    const supportedBySubscription = new Map<
+      string,
+      SnapshotRecommendation[]
+    >()
+    for (const item of supportedRecommendations) {
+      const key = item.subscriptionId.toLowerCase()
+      const existing = supportedBySubscription.get(key) ?? []
+      existing.push(item)
+      supportedBySubscription.set(key, existing)
+    }
     const snapshotSubscriptions: SnapshotSubscription[] = subscriptions.map(
       (subscription) => {
         const key = subscription.subscriptionId.toLowerCase()
         const items = recommendationsBySubscription.get(key) ?? []
+        const supportedItems = supportedBySubscription.get(key) ?? []
         const owned = items.filter(
           (item) => item.owner.source !== 'unassigned',
         ).length
         const currency =
-          currencyBySubscription.get(key) ?? fallbackCurrency
+          currencyBySubscription.get(key) ?? null
         return {
           id: subscription.subscriptionId,
           name: subscription.displayName,
           tenantId: subscription.tenantId,
           state: subscription.state,
           monthlyCost:
-            costBySubscription.get(key)?.representativeTotal ?? 0,
-          potentialMonthlySavings: items
-            .filter((item) => item.currency === currency)
+            costBySubscription.get(key)?.representativeTotal ?? null,
+          potentialMonthlySavings: supportedItems
+            .filter(
+              (item) =>
+                currency !== null &&
+                item.currency === currency &&
+                item.estimatedMonthlySavings !== null,
+            )
             .reduce(
-              (sum, item) => sum + item.estimatedMonthlySavings,
+              (sum, item) => sum + (item.estimatedMonthlySavings ?? 0),
               0,
             ),
           openRecommendations: items.length,
           ownerCoverage: items.length ? (owned / items.length) * 100 : 100,
           currency,
+          costBasis: 'median_completed_month_amortized_pretax_cost',
           resourceCount: resourceCounts.get(key) ?? 0,
         }
       },
@@ -1631,11 +2867,16 @@ export class AzureProvider implements ProspectorProvider {
         currency,
         points: [...monthlyTotals.entries()]
           .sort(([left], [right]) => left.localeCompare(right))
-          .map(([period, actualCost]) => ({
+          .map(([period, observedAmortizedCost]) => ({
             period,
-            actualCost,
+            observedAmortizedCost,
+            opportunityScenarioCost:
+              observedAmortizedCost *
+              (1 - (opportunityRatios.get(currency) ?? 0)),
+            measuredSavings: null,
+            actualCost: observedAmortizedCost,
             optimizedCost:
-              actualCost *
+              observedAmortizedCost *
               (1 - (opportunityRatios.get(currency) ?? 0)),
             realizedSavings: 0,
           })),
@@ -1654,6 +2895,9 @@ export class AzureProvider implements ProspectorProvider {
     const ownershipPercentage = recommendations.length
       ? (owned / recommendations.length) * 100
       : 100
+    const vmTelemetryPercentage = vmTelemetrySelectedCount
+      ? (vmTelemetrySufficientCount / vmTelemetrySelectedCount) * 100
+      : 0
     const coverageStatus = (
       percentage: number,
     ): 'complete' | 'partial' | 'missing' =>
@@ -1712,15 +2956,26 @@ export class AzureProvider implements ProspectorProvider {
               : undefined,
         },
         {
-          key: 'vm-guest-telemetry',
-          label: 'VM and guest telemetry',
-          description:
-            'Guest metrics and workload telemetry are not queried; VM schedule findings use inventory heuristics only.',
-          percentage: 0,
-          status: 'missing',
-          source: 'Azure Monitor',
+          key: 'vm-platform-telemetry',
+          label: 'Selected VM platform telemetry',
+          description: vmTelemetrySelectedCount
+            ? `${vmTelemetrySufficientCount} of ${vmTelemetrySelectedCount} selected evidence-relevant VM candidates returned at least ${
+                VM_SCHEDULE_MINIMUM_COVERAGE * 100
+              }% of the completed 30-day hourly availability window; ${vmTelemetryRetrievedCount} returned some availability data. ${vmTelemetryCandidateCount} candidates were identified. Guest memory was not collected.`
+            : 'No evidence-relevant VM candidates were selected. Platform metrics are queried only for VM schedule or right-sizing findings; guest memory remains optional and was not collected.',
+          percentage: vmTelemetryPercentage,
+          coveredCount: vmTelemetrySufficientCount,
+          totalCount: vmTelemetrySelectedCount,
+          status:
+            vmTelemetrySelectedCount === 0
+              ? 'unavailable'
+              : coverageStatus(vmTelemetryPercentage),
+          source: 'Azure Monitor Metrics and Activity Log',
           action:
-            'Connect Azure Monitor telemetry to validate utilization-based findings.',
+            vmTelemetrySelectedCount > 0 &&
+            vmTelemetryPercentage < 100
+              ? 'Grant Monitoring Reader access or inspect per-finding retrieval errors. Azure Monitor Agent is not required for platform metrics.'
+              : undefined,
         },
         {
           key: 'storage-last-access',

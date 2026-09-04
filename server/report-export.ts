@@ -6,7 +6,7 @@ import type {
 } from '../src/shared/types.js'
 
 export const ASSESSMENT_REPORT_SCHEMA =
-  'azure-prospector/assessment-report@1' as const
+  'azure-prospector/assessment-report@2' as const
 
 export const FINDINGS_CSV_COLUMNS = [
   'id',
@@ -27,6 +27,9 @@ export const FINDINGS_CSV_COLUMNS = [
   'resourceGroup',
   'location',
   'estimatedMonthlySavings',
+  'azureEstimatedMonthlySavings',
+  'calculatedMonthlySavings',
+  'measuredMonthlySavings',
   'currentMonthlyCost',
   'currency',
   'confidence',
@@ -48,6 +51,16 @@ export const FINDINGS_CSV_COLUMNS = [
   'exceptionCreatedBy',
   'exceptionCreatedAt',
   'exceptionExpiresAt',
+  'claimLevel',
+  'decisionStatus',
+  'validationState',
+  'claimRuleVersion',
+  'provenance',
+  'evidenceWindow',
+  'formula',
+  'missingEvidence',
+  'overlapIdentity',
+  'vmTelemetry',
 ] as const
 
 export interface AssessmentReportIdentity {
@@ -298,6 +311,9 @@ function findingCsvRow(finding: Redacted<Recommendation>): unknown[] {
     finding.resourceGroup,
     finding.location,
     finding.estimatedMonthlySavings,
+    finding.azureEstimatedMonthlySavings,
+    finding.calculatedMonthlySavings,
+    finding.measuredMonthlySavings,
     finding.currentMonthlyCost,
     finding.currency,
     finding.confidence,
@@ -319,6 +335,16 @@ function findingCsvRow(finding: Redacted<Recommendation>): unknown[] {
     finding.exception?.createdBy,
     finding.exception?.createdAt,
     finding.exception?.expiresAt,
+    finding.claim?.level,
+    finding.claim?.decisionStatus,
+    finding.claim?.validationState,
+    finding.claim?.ruleVersion,
+    finding.claim?.provenance,
+    finding.claim?.evidenceWindow,
+    finding.claim?.formula,
+    finding.claim?.missingEvidence,
+    finding.claim?.overlap,
+    finding.vmTelemetry,
   ]
 }
 

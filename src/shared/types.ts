@@ -38,6 +38,29 @@ export type RecommendationStatus = (typeof recommendationStatuses)[number]
 export type ConfidenceBand = 'high' | 'medium' | 'low'
 export type Effort = 'low' | 'medium' | 'high'
 export type Risk = 'low' | 'medium' | 'high'
+export type RecommendationClaimLevel =
+  | 'observed_fact'
+  | 'azure_estimate'
+  | 'calculated_scenario'
+  | 'investigation_lead'
+  | 'measured_result'
+export type DecisionReadinessStatus =
+  | 'needs_evidence'
+  | 'needs_validation'
+  | 'decision_ready'
+  | 'measurement_pending'
+  | 'measured'
+export type ClaimValidationState =
+  | 'unvalidated'
+  | 'azure_authored'
+  | 'deterministic_calculation'
+  | 'independently_validated'
+  | 'measured'
+export type ActivityClassificationMethod =
+  | 'recommendation_type_id'
+  | 'text_fallback'
+  | 'deterministic_rule'
+  | 'legacy_migration'
 export type ScanMode = 'demo' | 'live'
 export type ScanStatus = 'running' | 'completed' | 'failed'
 export type ActionStatus = 'proposed' | 'approved' | 'running' | 'completed' | 'failed'
@@ -73,6 +96,153 @@ export interface EvidencePoint {
   observedAt?: string
 }
 
+export type SerializableScalar = string | number | boolean | null
+
+export interface RecommendationProvenance {
+  provider: string
+  sourceFamily: string
+  sourceApi: string
+  sourceApiVersion?: string
+  collectedAt: string
+  nativeRecommendationId?: string
+  nativeRecommendationResourceId?: string
+  nativeRecommendationTypeId?: string
+  nativeStatus?: string
+  nativeLastUpdatedAt?: string
+  nativeImpact?: string
+  nativeRisk?: string
+  nativeLookbackDays?: number
+  activityClassification: ActivityClassificationMethod
+  extendedProperties: Record<string, SerializableScalar>
+  advisorConfiguration?: {
+    source: 'Azure Advisor configuration'
+    scope: string
+    resourceId?: string
+    lowCpuThreshold?: number
+  }
+}
+
+export interface RecommendationEvidenceWindow {
+  startAt?: string
+  endAt?: string
+  lookbackDays?: number
+  description: string
+}
+
+export interface RecommendationFormulaInput {
+  name: string
+  value: SerializableScalar
+  unit?: string
+  sourceEvidenceLabel?: string
+}
+
+export interface RecommendationFormula {
+  expression: string
+  inputs: RecommendationFormulaInput[]
+  assumptions: string[]
+  exclusions: string[]
+  ruleVersion: string
+}
+
+export type SavingsSequenceStage =
+  | 'usage_optimization'
+  | 'independent'
+  | 'reservation'
+  | 'savings_plan'
+  | 'measurement'
+
+export interface RecommendationOverlapIdentity {
+  scopeKey: string
+  spendPoolKey: string
+  alternativeGroup?: string
+  sequenceStage: SavingsSequenceStage
+  sequenceOrder: number
+  mutuallyExclusiveActivities: SavingsActivity[]
+}
+
+export interface RecommendationClaim {
+  level: RecommendationClaimLevel
+  decisionStatus: DecisionReadinessStatus
+  validationState: ClaimValidationState
+  ruleVersion: string
+  provenance: RecommendationProvenance
+  evidenceWindow: RecommendationEvidenceWindow
+  formula?: RecommendationFormula
+  missingEvidence: string[]
+  overlap: RecommendationOverlapIdentity
+}
+
+export interface VmMetricSeriesSummary {
+  dimensions: Record<string, string>
+  sampleCount: number
+  sampleCountBasis: 'azure_count' | 'populated_buckets'
+  populatedBuckets: number
+  missingDataPercentage: number
+  minimum: number | null
+  average: number | null
+  maximum: number | null
+  percentile95: number | null
+  total: number | null
+}
+
+export interface VmMetricSummary {
+  name: string
+  unit: string
+  requestedAggregations: string[]
+  expectedBuckets: number
+  populatedBuckets: number
+  sampleCount: number
+  sampleCountBasis: 'azure_count' | 'populated_buckets'
+  missingDataPercentage: number
+  minimum: number | null
+  average: number | null
+  maximum: number | null
+  percentile95: number | null
+  total: number | null
+  series: VmMetricSeriesSummary[]
+  error?: string
+}
+
+export interface VmAvailabilitySummary {
+  expectedBuckets: number
+  populatedBuckets: number
+  unknownBuckets: number
+  missingDataPercentage: number
+  observedAvailableHours: number
+  knownAvailabilityPercentage: number | null
+  nearContinuousAvailability: boolean
+  contextValues: string[]
+  caveat: string
+}
+
+export interface VmActivityLogEvent {
+  operation: string
+  status: string
+  timestamp: string
+  correlationId?: string
+}
+
+export interface VmActivityLogSummary {
+  events: VmActivityLogEvent[]
+  error?: string
+}
+
+export interface VmTelemetryEvidence {
+  resourceId: string
+  collectedAt: string
+  window: {
+    startAt: string
+    endAt: string
+    interval: 'PT1H'
+    expectedBuckets: number
+  }
+  availability: VmAvailabilitySummary
+  metrics: VmMetricSummary[]
+  activityLog: VmActivityLogSummary
+  retrievalErrors: string[]
+  guestMemoryStatus: 'not_collected'
+}
+
 export interface RecommendationOwner {
   displayName: string
   email?: string
@@ -99,9 +269,14 @@ export interface Recommendation {
   resourceType: string
   resourceGroup?: string
   location?: string
-  estimatedMonthlySavings: number
-  currentMonthlyCost: number
-  currency: string
+  estimatedMonthlySavings: number | null
+  azureEstimatedMonthlySavings: number | null
+  calculatedMonthlySavings: number | null
+  measuredMonthlySavings: number | null
+  currentMonthlyCost: number | null
+  currency: string | null
+  claim: RecommendationClaim
+  vmTelemetry?: VmTelemetryEvidence
   /** Normalized score from 0 to 1. */
   confidence: number
   confidenceBand: ConfidenceBand
@@ -162,11 +337,12 @@ export interface SubscriptionSummary {
   name: string
   tenantId?: string
   state: string
-  monthlyCost: number
+  monthlyCost: number | null
   potentialMonthlySavings: number
   openRecommendations: number
   ownerCoverage: number
-  currency: string
+  currency: string | null
+  costBasis: 'median_completed_month_amortized_pretax_cost'
 }
 
 export interface CoverageItem {
@@ -176,13 +352,21 @@ export interface CoverageItem {
   percentage: number
   status: 'complete' | 'partial' | 'missing' | 'unavailable'
   source: string
+  coveredCount?: number
+  totalCount?: number
   action?: string
 }
 
 export interface CostTrendPoint {
   period: string
+  observedAmortizedCost: number
+  opportunityScenarioCost: number
+  measuredSavings: number | null
+  /** @deprecated Use observedAmortizedCost. */
   actualCost: number
+  /** @deprecated Use opportunityScenarioCost. */
   optimizedCost: number
+  /** @deprecated Use measuredSavings; zero does not imply measurement. */
   realizedSavings: number
 }
 
@@ -194,12 +378,22 @@ export interface MonetaryAmount {
 export interface CurrencyFinancialSummary {
   currency: string
   monthlyCost: number
+  costBasis: 'median_completed_month_amortized_pretax_cost'
   potentialMonthlySavings: number
   annualizedPotentialSavings: number
-  realizedSavingsLast30Days: number
-  realizedSavingsAllTime: number
-  verifiedMeasurementCount: number
+  annualizationMethod: 'monthly_estimate_x_12'
+  measuredSavingsLast30Days: number | null
+  measuredSavingsAllTime: number | null
+  measuredResultCount: number
+  measuredResultCoverage: number | null
+  /** @deprecated Use measuredResultCoverage. Kept numeric for API compatibility. */
   measurementCoverage: number
+  /** @deprecated Use measuredSavingsLast30Days. */
+  realizedSavingsLast30Days: number
+  /** @deprecated Use measuredSavingsAllTime. */
+  realizedSavingsAllTime: number
+  /** @deprecated Use measuredResultCount. */
+  verifiedMeasurementCount: number
   costTrend: CostTrendPoint[]
 }
 
@@ -211,8 +405,12 @@ export interface CategorySummary {
 
 export interface SavingsSummary {
   byCurrency: CurrencyFinancialSummary[]
-  verifiedMeasurementCount: number
+  measuredResultCount: number
+  measuredResultCoverage: number | null
+  /** @deprecated Use measuredResultCoverage. Kept numeric for API compatibility. */
   measurementCoverage: number
+  /** @deprecated Use measuredResultCount. */
+  verifiedMeasurementCount: number
 }
 
 export interface EstateSummary {

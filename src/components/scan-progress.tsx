@@ -27,7 +27,7 @@ export function ScanProgress({
             aria-hidden="true"
           />
           <Cloud
-            className="absolute bottom-1 left-0 size-5 animate-pulse text-success"
+            className="absolute bottom-1 left-0 size-5 animate-pulse text-primary"
             aria-hidden="true"
           />
         </div>

@@ -39,8 +39,95 @@ function recommendation(
     resourceGroup: 'rg-app',
     location: 'uksouth',
     estimatedMonthlySavings: 123.45,
+    azureEstimatedMonthlySavings: 123.45,
+    calculatedMonthlySavings: null,
+    measuredMonthlySavings: null,
     currentMonthlyCost: 456.78,
     currency: 'GBP',
+    vmTelemetry: {
+      resourceId:
+        '/subscriptions/subscription-1/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/vm-app',
+      collectedAt: '2026-09-03T12:00:00.000Z',
+      window: {
+        startAt: '2026-08-04T00:00:00.000Z',
+        endAt: '2026-09-03T00:00:00.000Z',
+        interval: 'PT1H',
+        expectedBuckets: 720,
+      },
+      availability: {
+        expectedBuckets: 720,
+        populatedBuckets: 720,
+        unknownBuckets: 0,
+        missingDataPercentage: 0,
+        observedAvailableHours: 720,
+        knownAvailabilityPercentage: 100,
+        nearContinuousAvailability: true,
+        contextValues: ['Customer'],
+        caveat:
+          'Null availability is unknown, not definitively deallocated.',
+      },
+      metrics: [],
+      activityLog: {
+        events: [
+          {
+            operation: 'Microsoft.Compute/virtualMachines/start/action',
+            status: 'Succeeded',
+            timestamp: '2026-08-10T08:00:00.000Z',
+          },
+        ],
+      },
+      retrievalErrors: [],
+      guestMemoryStatus: 'not_collected',
+    },
+    claim: {
+      level: 'azure_estimate',
+      decisionStatus: 'needs_validation',
+      validationState: 'azure_authored',
+      ruleVersion: 'azure-advisor-v2',
+      provenance: {
+        provider: 'azure',
+        sourceFamily: 'azure:advisor-cost',
+        sourceApi: 'Azure Advisor via Azure Resource Graph',
+        sourceApiVersion: '2022-10-01',
+        collectedAt: '2026-09-03T12:00:00.000Z',
+        nativeRecommendationId: 'advisor-1',
+        nativeRecommendationTypeId: 'type-1',
+        nativeStatus: 'New',
+        nativeLastUpdatedAt: '2026-09-02T12:00:00.000Z',
+        nativeImpact: 'High',
+        nativeLookbackDays: 30,
+        activityClassification: 'recommendation_type_id',
+        extendedProperties: { savingsAmount: '123.45' },
+      },
+      evidenceWindow: {
+        lookbackDays: 30,
+        description: 'Azure Advisor usage lookback of 30 days',
+      },
+      formula: {
+        expression: 'azure_advisor_monthly_savings',
+        inputs: [
+          {
+            name: 'azure_advisor_monthly_savings',
+            value: 123.45,
+            unit: 'GBP',
+          },
+        ],
+        assumptions: ['The monthly period is authored by Azure Advisor.'],
+        exclusions: ['No independent validation of the forecast.'],
+        ruleVersion: 'azure-advisor-v2',
+      },
+      missingEvidence: ['Independent validation'],
+      overlap: {
+        scopeKey: 'subscription-1|right-sizing',
+        spendPoolKey: 'subscription-1|compute-usage',
+        sequenceStage: 'usage_optimization',
+        sequenceOrder: 10,
+        mutuallyExclusiveActivities: [
+          'reserved_instances',
+          'savings_plans',
+        ],
+      },
+    },
     confidence: 0.91,
     confidenceBand: 'high',
     effort: 'low',
@@ -113,28 +200,42 @@ const overview: OverviewResponse = {
       {
         currency: 'GBP',
         monthlyCost: 456.78,
+        costBasis: 'median_completed_month_amortized_pretax_cost',
         potentialMonthlySavings: 123.45,
         annualizedPotentialSavings: 1481.4,
-        realizedSavingsLast30Days: 20,
-        realizedSavingsAllTime: 75,
-        verifiedMeasurementCount: 1,
-        measurementCoverage: 1,
+        annualizationMethod: 'monthly_estimate_x_12',
+        measuredSavingsLast30Days: null,
+        measuredSavingsAllTime: null,
+        measuredResultCount: 0,
+        measuredResultCoverage: null,
+        measurementCoverage: 0,
+        realizedSavingsLast30Days: 0,
+        realizedSavingsAllTime: 0,
+        verifiedMeasurementCount: 0,
         costTrend: [],
       },
       {
         currency: 'EUR',
         monthlyCost: 320,
+        costBasis: 'median_completed_month_amortized_pretax_cost',
         potentialMonthlySavings: 80,
         annualizedPotentialSavings: 960,
+        annualizationMethod: 'monthly_estimate_x_12',
+        measuredSavingsLast30Days: null,
+        measuredSavingsAllTime: null,
+        measuredResultCount: 0,
+        measuredResultCoverage: null,
+        measurementCoverage: 0,
         realizedSavingsLast30Days: 0,
         realizedSavingsAllTime: 0,
         verifiedMeasurementCount: 0,
-        measurementCoverage: 0,
         costTrend: [],
       },
     ],
-    verifiedMeasurementCount: 1,
-    measurementCoverage: 0.5,
+    measuredResultCount: 0,
+    measuredResultCoverage: null,
+    measurementCoverage: 0,
+    verifiedMeasurementCount: 0,
   },
   openRecommendations: 1,
   highConfidenceRecommendations: 1,
@@ -161,6 +262,7 @@ const overview: OverviewResponse = {
       openRecommendations: 1,
       ownerCoverage: 1,
       currency: 'GBP',
+      costBasis: 'median_completed_month_amortized_pretax_cost',
     },
   ],
   coverage: [],
@@ -196,6 +298,20 @@ describe('assessment report export', () => {
     expect(report.exportedAt).toBe(exportedAt)
     expect(report.findings).toHaveLength(1)
     expect(report.findings[0]?.activity).toBe('right_sizing')
+    expect(report.findings[0]?.claim?.level).toBe('azure_estimate')
+    expect(report.findings[0]?.claim?.provenance?.nativeStatus).toBe('New')
+    expect(report.findings[0]?.claim?.formula?.expression).toBe(
+      'azure_advisor_monthly_savings',
+    )
+    expect(report.findings[0]?.claim?.missingEvidence).toEqual([
+      'Independent validation',
+    ])
+    expect(report.findings[0]?.claim?.overlap?.sequenceStage).toBe(
+      'usage_optimization',
+    )
+    expect(report.findings[0]?.vmTelemetry?.availability?.contextValues).toEqual(
+      ['Customer'],
+    )
     expect(report.remediationActions).toHaveLength(1)
     expect(report.remediationActions[0]).toMatchObject({
       id: action.id,
@@ -284,12 +400,17 @@ describe('assessment report export', () => {
 
     expect(csv.startsWith(FINDINGS_CSV_COLUMNS.map(quoted).join(','))).toBe(true)
     expect(csv).toContain('"compute","right_sizing"')
+    expect(csv).toContain('"azure_estimate","needs_validation","azure_authored"')
+    expect(csv).toContain('azure_advisor_monthly_savings')
+    expect(csv).toContain('Independent validation')
+    expect(csv).toContain('compute-usage')
+    expect(csv).toContain('not definitively deallocated')
     expect(csv).toContain('"Quarterly, ""archive""\r\nreview"')
     expect(csv).toContain(
       '"\'=HYPERLINK(""https://example.test"")"',
     )
     expect(csv).toContain('"\'\t=1+1"')
-    expect(csv).toContain('"123.45","456.78","GBP"')
+    expect(csv).toContain('"123.45","123.45","","","456.78","GBP"')
     expect(csv).toContain('""environment"":""[REDACTED]""')
     expect(csv).not.toContain('<TEST_SECRET>')
     expect(csv).not.toContain('accessToken')

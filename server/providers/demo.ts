@@ -1,16 +1,22 @@
 import { createHash } from 'node:crypto'
 import type {
   ConfidenceBand,
+  RecommendationClaim,
   RecommendationCategory,
   RecommendationOwner,
+  SavingsActivity,
 } from '../../src/shared/types.js'
-import { classifySavingsActivity } from '../../src/shared/savings-activity.js'
+import {
+  classifySavingsActivity,
+  savingsOpportunityScopeKey,
+} from '../../src/shared/savings-activity.js'
 import type {
   ProspectorProvider,
   ProviderCollectRequest,
   ProviderSnapshot,
   SnapshotRecommendation,
 } from './types.js'
+import { selectSupportedOpportunityRecommendations } from '../opportunity-scenario.js'
 
 interface DemoRecommendationInput {
   source: SnapshotRecommendation['source']
@@ -24,8 +30,8 @@ interface DemoRecommendationInput {
   resourceType: string
   resourceGroup: string
   location: string
-  savings: number
-  cost: number
+  savings: number | null
+  cost: number | null
   confidence: number
   effort: SnapshotRecommendation['effort']
   risk: SnapshotRecommendation['risk']
@@ -75,6 +81,8 @@ function recommendation(input: DemoRecommendationInput): SnapshotRecommendation 
   const fingerprint = stableId(
     `demo|${input.source}|${resourceId}|${input.title}`.toLowerCase(),
   )
+  const activity = classifySavingsActivity(input)
+  const claim = demoClaim(input, activity, resourceId, fingerprint)
 
   return {
     id: `rec_${fingerprint}`,
@@ -82,7 +90,7 @@ function recommendation(input: DemoRecommendationInput): SnapshotRecommendation 
     source: input.source,
     sourceFamily: `demo:${input.source}`,
     category: input.category,
-    activity: classifySavingsActivity(input),
+    activity,
     title: input.title,
     description: input.description,
     suggestedAction: input.suggestedAction,
@@ -94,8 +102,15 @@ function recommendation(input: DemoRecommendationInput): SnapshotRecommendation 
     resourceGroup: input.resourceGroup,
     location: input.location,
     estimatedMonthlySavings: input.savings,
+    azureEstimatedMonthlySavings:
+      claim.level === 'azure_estimate' ? input.savings : null,
+    calculatedMonthlySavings:
+      claim.level === 'calculated_scenario' ? input.savings : null,
+    measuredMonthlySavings:
+      claim.level === 'measured_result' ? input.savings : null,
     currentMonthlyCost: input.cost,
     currency: 'USD',
+    claim,
     confidence: input.confidence,
     confidenceBand: confidenceBand(input.confidence),
     effort: input.effort,
@@ -110,6 +125,115 @@ function recommendation(input: DemoRecommendationInput): SnapshotRecommendation 
     tags: input.tags ?? {},
     firstSeenAt: '2026-01-15T09:00:00.000Z',
     lastSeenAt: new Date().toISOString(),
+  }
+}
+
+function demoClaim(
+  input: DemoRecommendationInput,
+  activity: SavingsActivity,
+  resourceId: string,
+  fingerprint: string,
+): RecommendationClaim {
+  const sourceFamily = `demo:${input.source}`
+  const scopeKey = savingsOpportunityScopeKey({
+    activity,
+    subscriptionId: input.subscriptionId,
+    title: input.title,
+    resourceType: input.resourceType,
+    resourceId,
+    fingerprint,
+    evidence: input.evidence,
+  })
+  const investigationLead =
+    activity === 'shutdown_scheduling' || input.savings === null
+  const calculated =
+    input.source === 'resource_graph' ||
+    input.source === 'cost_management' ||
+    input.source === 'prospector'
+  const level = investigationLead
+    ? 'investigation_lead'
+    : calculated
+      ? 'calculated_scenario'
+      : 'azure_estimate'
+  const sequence =
+    activity === 'reserved_instances'
+      ? { sequenceStage: 'reservation' as const, sequenceOrder: 20 }
+      : activity === 'savings_plans'
+        ? { sequenceStage: 'savings_plan' as const, sequenceOrder: 30 }
+        : ['right_sizing', 'shutdown_scheduling'].includes(activity)
+          ? {
+              sequenceStage: 'usage_optimization' as const,
+              sequenceOrder: 10,
+            }
+          : { sequenceStage: 'independent' as const, sequenceOrder: 10 }
+  return {
+    level,
+    decisionStatus: investigationLead ? 'needs_evidence' : 'needs_validation',
+    validationState: investigationLead
+      ? 'unvalidated'
+      : calculated
+        ? 'deterministic_calculation'
+        : 'azure_authored',
+    ruleVersion: 'demo-fixture-v1',
+    provenance: {
+      provider: 'demo',
+      sourceFamily,
+      sourceApi: 'Deterministic demo fixture',
+      collectedAt: input.evidence[0]?.observedAt ?? new Date().toISOString(),
+      activityClassification:
+        input.source === 'advisor' ? 'text_fallback' : 'deterministic_rule',
+      extendedProperties: {},
+    },
+    evidenceWindow: {
+      endAt: input.evidence[0]?.observedAt,
+      description: 'Representative demo evidence window.',
+    },
+    ...(investigationLead
+      ? {}
+      : calculated
+        ? {
+            formula: {
+              expression: 'demo_fixture_value',
+              inputs: [
+                {
+                  name: 'demo_fixture_value',
+                  value: input.savings,
+                  unit: 'USD',
+                },
+              ],
+              assumptions: ['Representative demo data only.'],
+              exclusions: ['Not derived from a live Azure workload.'],
+              ruleVersion: 'demo-fixture-v1',
+            },
+          }
+        : {}),
+    missingEvidence: investigationLead
+      ? [
+          'Historical runtime and utilization telemetry',
+          'Required operating hours',
+        ]
+      : [],
+    overlap: {
+      scopeKey,
+      spendPoolKey: `${input.subscriptionId.toLowerCase()}|${
+        ['reserved_instances', 'savings_plans', 'right_sizing', 'shutdown_scheduling']
+          .includes(activity)
+          ? 'compute-usage'
+          : resourceId.toLowerCase()
+      }`,
+      ...(activity === 'reserved_instances' || activity === 'savings_plans'
+        ? { alternativeGroup: scopeKey }
+        : {}),
+      ...sequence,
+      mutuallyExclusiveActivities:
+        activity === 'reserved_instances'
+          ? ['savings_plans']
+          : activity === 'savings_plans'
+            ? ['reserved_instances']
+            : ['right_sizing', 'shutdown_scheduling'].includes(activity)
+              ? ['reserved_instances', 'savings_plans']
+              : [],
+    },
   }
 }
 
@@ -234,7 +358,7 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
       resourceType: 'Microsoft.Compute/virtualMachines',
       resourceGroup: 'rg-integration-test',
       location: 'centralus',
-      savings: 198,
+      savings: null,
       cost: 396,
       confidence: 0.48,
       effort: 'low',
@@ -470,12 +594,14 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (5 - index), 1),
     )
     const actualCost = 79_300 + index * 1_444
-    const realizedSavings = 1_150 + index * 275
     return {
       period: monthKey(date),
+      observedAmortizedCost: actualCost,
+      opportunityScenarioCost: actualCost * 0.92,
+      measuredSavings: null,
       actualCost,
       optimizedCost: actualCost * 0.92,
-      realizedSavings,
+      realizedSavings: 0,
     }
   })
 
@@ -484,6 +610,12 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
     const existing = bySubscription.get(item.subscriptionId) ?? []
     existing.push(item)
     bySubscription.set(item.subscriptionId, existing)
+  }
+  const supportedBySubscription = new Map<string, SnapshotRecommendation[]>()
+  for (const item of selectSupportedOpportunityRecommendations(recommendations)) {
+    const existing = supportedBySubscription.get(item.subscriptionId) ?? []
+    existing.push(item)
+    supportedBySubscription.set(item.subscriptionId, existing)
   }
   const completeSourceFamilies = [
     'demo:advisor',
@@ -503,18 +635,21 @@ export function createDemoSnapshot(now = new Date()): ProviderSnapshot {
     ),
     subscriptions: DEMO_SUBSCRIPTIONS.map((subscription) => {
       const items = bySubscription.get(subscription.id) ?? []
+      const supportedItems =
+        supportedBySubscription.get(subscription.id) ?? []
       const owned = items.filter(
         (item) => item.owner.source !== 'unassigned',
       ).length
       return {
         ...subscription,
-        potentialMonthlySavings: items.reduce(
-          (sum, item) => sum + item.estimatedMonthlySavings,
+        potentialMonthlySavings: supportedItems.reduce(
+          (sum, item) => sum + (item.estimatedMonthlySavings ?? 0),
           0,
         ),
         openRecommendations: items.length,
         ownerCoverage: items.length ? Math.round((owned / items.length) * 100) : 100,
         currency: 'USD',
+        costBasis: 'median_completed_month_amortized_pretax_cost',
       }
     }),
     recommendations,

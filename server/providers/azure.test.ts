@@ -2,6 +2,7 @@ import type { TokenCredential } from '@azure/identity'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   AzureProvider,
+  classifyAdvisorSavingsActivity,
   createCostQueryPlan,
 } from './azure.js'
 import { calculateOpportunityReductionRatios } from '../opportunity-scenario.js'
@@ -9,6 +10,7 @@ import {
   classifySavingsActivity,
   savingsOpportunityScopeKey,
 } from '../../src/shared/savings-activity.js'
+import type { RecommendationClaim } from '../../src/shared/types.js'
 
 const originalFetch = globalThis.fetch
 const originalSubscriptionIds = process.env.PROSPECTOR_SUBSCRIPTION_IDS
@@ -59,6 +61,41 @@ function jsonResponse(
     status,
     headers: { 'Content-Type': 'application/json', ...headers },
   })
+}
+
+function scenarioClaim(
+  scopeKey: string,
+  level: RecommendationClaim['level'] = 'azure_estimate',
+): RecommendationClaim {
+  return {
+    level,
+    decisionStatus: 'needs_validation',
+    validationState:
+      level === 'azure_estimate'
+        ? 'azure_authored'
+        : 'deterministic_calculation',
+    ruleVersion: 'test-v1',
+    provenance: {
+      provider: 'azure',
+      sourceFamily: 'azure:advisor-cost',
+      sourceApi: 'Azure Advisor via Azure Resource Graph',
+      collectedAt: '2026-09-01T00:00:00.000Z',
+      activityClassification: 'text_fallback',
+      extendedProperties: {},
+    },
+    evidenceWindow: {
+      endAt: '2026-09-01T00:00:00.000Z',
+      description: 'Test evidence window.',
+    },
+    missingEvidence: [],
+    overlap: {
+      scopeKey,
+      spendPoolKey: 'subscription|compute-usage',
+      sequenceStage: 'usage_optimization',
+      sequenceOrder: 10,
+      mutuallyExclusiveActivities: ['reserved_instances', 'savings_plans'],
+    },
+  }
 }
 
 describe('AzureProvider', () => {
@@ -151,6 +188,30 @@ describe('AzureProvider', () => {
     expect(classifySavingsActivity(input)).toBe(expected)
   })
 
+  it('prefers known Advisor recommendation type IDs and documents fallback', () => {
+    expect(
+      classifyAdvisorSavingsActivity({
+        recommendationTypeId: '84b1a508-fc21-49da-979e-96894f1665df',
+        title: 'Localized title',
+        description: 'Localized description',
+        category: 'commitment',
+        resourceType: 'Microsoft.Subscriptions/subscriptions',
+      }),
+    ).toEqual({
+      activity: 'savings_plans',
+      method: 'recommendation_type_id',
+    })
+    expect(
+      classifyAdvisorSavingsActivity({
+        recommendationTypeId: 'unknown-type',
+        title: 'Right-size the underutilized VM',
+        description: 'Select a smaller SKU.',
+        category: 'compute',
+        resourceType: 'Microsoft.Compute/virtualMachines',
+      }),
+    ).toEqual({ activity: 'right_sizing', method: 'text_fallback' })
+  })
+
   it('builds a confidence-weighted, per-resource opportunity scenario', () => {
     const ratios = calculateOpportunityReductionRatios(
       [
@@ -165,6 +226,7 @@ describe('AzureProvider', () => {
           estimatedMonthlySavings: 200,
           currentMonthlyCost: 300,
           confidence: 0.8,
+          claim: scenarioClaim('resource-one'),
         },
         {
           currency: 'GBP',
@@ -177,6 +239,7 @@ describe('AzureProvider', () => {
           estimatedMonthlySavings: 100,
           currentMonthlyCost: 300,
           confidence: 0.9,
+          claim: scenarioClaim('resource-one'),
         },
         {
           currency: 'USD',
@@ -188,6 +251,7 @@ describe('AzureProvider', () => {
           estimatedMonthlySavings: 500,
           currentMonthlyCost: 0,
           confidence: 0.8,
+          claim: scenarioClaim('advisor-only'),
         },
       ],
       [
@@ -198,6 +262,55 @@ describe('AzureProvider', () => {
 
     expect(ratios.get('GBP')).toBeCloseTo(0.16)
     expect(ratios.get('USD')).toBe(0)
+  })
+
+  it('sequences usage optimization before mutually exclusive commitments', () => {
+    const base = {
+      currency: 'GBP',
+      subscriptionId: 'sub-one',
+      resourceType: 'Microsoft.Compute/virtualMachines',
+      currentMonthlyCost: 1000,
+      confidence: 1,
+      evidence: [],
+    }
+    const rightSize = {
+      ...base,
+      activity: 'right_sizing' as const,
+      resourceId: 'vm-one',
+      fingerprint: 'right-size',
+      title: 'Right-size VM',
+      estimatedMonthlySavings: 200,
+      claim: scenarioClaim('vm-one'),
+    }
+    const reservation = {
+      ...base,
+      activity: 'reserved_instances' as const,
+      fingerprint: 'reservation',
+      title: 'Reserve compute',
+      estimatedMonthlySavings: 300,
+      claim: scenarioClaim('reservation-scope'),
+    }
+    const savingsPlan = {
+      ...base,
+      activity: 'savings_plans' as const,
+      fingerprint: 'savings-plan',
+      title: 'Purchase savings plan',
+      estimatedMonthlySavings: 400,
+      claim: scenarioClaim('savings-plan-scope'),
+    }
+
+    expect(
+      calculateOpportunityReductionRatios(
+        [rightSize, reservation, savingsPlan],
+        [{ currency: 'GBP', monthlyCost: 1000 }],
+      ).get('GBP'),
+    ).toBe(0.2)
+    expect(
+      calculateOpportunityReductionRatios(
+        [reservation, savingsPlan],
+        [{ currency: 'GBP', monthlyCost: 1000 }],
+      ).get('GBP'),
+    ).toBe(0.4)
   })
 
   it('uses one stable scope for alternative commitment scenarios', () => {
@@ -329,6 +442,7 @@ describe('AzureProvider', () => {
                 advisorRecommendationId: 'advisor-eur',
                 properties: {
                   category: 'Cost',
+                  recommendationStatus: 'New',
                   impactedField: 'Microsoft.Compute/virtualMachines',
                   resourceMetadata: {
                     resourceId:
@@ -366,7 +480,9 @@ describe('AzureProvider', () => {
         }
       },
     }
-    const provider = new AzureProvider(credential, 'tenant-one')
+    const provider = new AzureProvider(credential, 'tenant-one', {
+      telemetryMaximumCandidates: 0,
+    })
 
     const snapshot = await provider.collect({ tenantId: 'tenant-one' })
 
@@ -418,7 +534,7 @@ describe('AzureProvider', () => {
   it('does not invent USD for a successful zero-spend subscription', async () => {
     delete process.env.PROSPECTOR_SUBSCRIPTION_IDS
     let eurCostAttempts = 0
-    globalThis.fetch = vi.fn(async (input) => {
+    globalThis.fetch = vi.fn(async (input, init) => {
       const url = String(input)
       if (url.includes('/subscriptions?')) {
         return jsonResponse({
@@ -483,6 +599,36 @@ describe('AzureProvider', () => {
         })
       }
       if (url.includes('/providers/Microsoft.ResourceGraph/resources')) {
+        const query = (JSON.parse(String(init?.body)) as { query: string }).query
+        if (query.includes('microsoft.advisor/recommendations')) {
+          return jsonResponse({
+            data: [
+              {
+                id: '/subscriptions/sub-empty/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-empty',
+                advisorRecommendationId: 'advisor-no-currency',
+                name: 'vm-empty',
+                type: 'Microsoft.Compute/virtualMachines',
+                subscriptionId: 'sub-empty',
+                resourceGroup: 'rg',
+                tags: {},
+                properties: {
+                  category: 'Cost',
+                  recommendationStatus: 'New',
+                  impactedField: 'Microsoft.Compute/virtualMachines',
+                  resourceMetadata: {
+                    resourceId:
+                      '/subscriptions/sub-empty/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-empty',
+                  },
+                  shortDescription: {
+                    solution: 'Right-size the virtual machine',
+                    problem: 'The virtual machine is underutilized.',
+                  },
+                  extendedProperties: { savingsAmount: '25' },
+                },
+              },
+            ],
+          })
+        }
         return jsonResponse({ data: [] })
       }
       throw new Error(`Unexpected Azure request: ${url}`)
@@ -499,6 +645,7 @@ describe('AzureProvider', () => {
     const snapshot = await new AzureProvider(
       credential,
       'tenant-one',
+      { telemetryMaximumCandidates: 0 },
     ).collect({ tenantId: 'tenant-one' })
 
     expect(snapshot.currencyCostTrends).toHaveLength(1)
@@ -506,7 +653,606 @@ describe('AzureProvider', () => {
     expect(eurCostAttempts).toBe(2)
     expect(
       snapshot.subscriptions.find((item) => item.id === 'sub-empty')?.currency,
-    ).toBe('EUR')
+    ).toBeNull()
+    expect(snapshot.recommendations[0]).toMatchObject({
+      estimatedMonthlySavings: null,
+      currency: null,
+      claim: {
+        level: 'investigation_lead',
+        decisionStatus: 'needs_evidence',
+      },
+    })
+  })
+
+  it('filters Advisor lifecycle and treats invalid schedules as gaps', async () => {
+    delete process.env.PROSPECTOR_SUBSCRIPTION_IDS
+    const vmId = (name: string, group = 'rg-test') =>
+      `/subscriptions/sub-one/resourceGroups/${group}/providers/Microsoft.Compute/virtualMachines/${name}`
+    const advisor = (
+      id: string,
+      status: string | undefined,
+      group = 'rg-test',
+      recommendationTypeId = 'unknown-right-size-type',
+      maxCpuP95: string | null = '4.2',
+    ) => ({
+      id: vmId('advisor-vm', group),
+      advisorResourceId: `/subscriptions/sub-one/providers/Microsoft.Advisor/recommendations/${id}`,
+      advisorRecommendationId: id,
+      name: 'advisor-vm',
+      type: 'Microsoft.Compute/virtualMachines',
+      subscriptionId: 'sub-one',
+      resourceGroup: group,
+      location: 'uksouth',
+      tags: {},
+      properties: {
+        category: 'Cost',
+        ...(status ? { recommendationStatus: status } : {}),
+        recommendationTypeId,
+        lastUpdated: '2026-08-31T12:00:00.000Z',
+        impact: 'High',
+        risk: 'Medium',
+        impactedField: 'Microsoft.Compute/virtualMachines',
+        resourceMetadata: { resourceId: vmId('advisor-vm', group) },
+        shortDescription: {
+          solution: `Right-size ${id}`,
+          problem: 'The virtual machine is underutilized.',
+        },
+        extendedProperties: {
+          savingsAmount: '50',
+          savingsCurrency: 'GBP',
+          lookbackPeriod: '30',
+          ...(maxCpuP95 === null ? {} : { MaxCpuP95: maxCpuP95 }),
+        },
+      },
+    })
+    const vm = (name: string) => ({
+      id: vmId(name),
+      name,
+      type: 'Microsoft.Compute/virtualMachines',
+      subscriptionId: 'sub-one',
+      resourceGroup: 'rg-test',
+      location: 'uksouth',
+      tags: { environment: 'test' },
+      properties: {},
+    })
+    const schedule = (
+      name: string,
+      target: string,
+      status: string,
+      taskType: string,
+      includeTimeZone = true,
+    ) => ({
+      id: `/subscriptions/sub-one/resourceGroups/rg-test/providers/Microsoft.DevTestLab/schedules/${name}`,
+      name,
+      type: 'Microsoft.DevTestLab/schedules',
+      subscriptionId: 'sub-one',
+      resourceGroup: 'rg-test',
+      location: 'uksouth',
+      tags: {},
+      properties: {
+        targetResourceId: target,
+        status,
+        taskType,
+        dailyRecurrence: { time: '1900' },
+        ...(includeTimeZone ? { timeZoneId: 'UTC' } : {}),
+      },
+    })
+
+    globalThis.fetch = vi.fn(async (input, init) => {
+      const url = String(input)
+      if (url.includes('/subscriptions?')) {
+        return jsonResponse({
+          value: [
+            {
+              subscriptionId: 'sub-one',
+              displayName: 'Subscription one',
+              state: 'Enabled',
+              tenantId: 'tenant-one',
+            },
+          ],
+        })
+      }
+      if (url.includes('/Microsoft.CostManagement/query')) {
+        const body = JSON.parse(String(init?.body)) as {
+          dataset: { grouping: Array<{ name: string }> }
+        }
+        expect(body.dataset.grouping.map((group) => group.name)).toEqual([
+          'ResourceId',
+          'PricingModel',
+        ])
+        return jsonResponse({
+          properties: {
+            columns: [
+              { name: 'PreTaxCost' },
+              { name: 'ResourceId' },
+              { name: 'BillingMonth' },
+              { name: 'Currency' },
+            ],
+            rows: [
+              [100, vmId('vm-uncovered'), '202608', 'GBP'],
+              [100, vmId('vm-disabled'), '202608', 'GBP'],
+              [100, vmId('vm-startup'), '202608', 'GBP'],
+              [100, vmId('vm-covered'), '202608', 'GBP'],
+              [100, vmId('vm-incomplete'), '202608', 'GBP'],
+            ],
+          },
+        })
+      }
+      if (url.includes('/providers/Microsoft.ResourceGraph/resources')) {
+        const query = (JSON.parse(String(init?.body)) as { query: string }).query
+        if (query.includes('microsoft.advisor/configurations')) {
+          return jsonResponse({
+            data: [
+              {
+                id: '/subscriptions/sub-one/providers/Microsoft.Advisor/configurations/default',
+                name: 'default',
+                type: 'Microsoft.Advisor/configurations',
+                subscriptionId: 'sub-one',
+                properties: { exclude: false, lowCpuThreshold: '5' },
+              },
+              {
+                id: '/subscriptions/sub-one/resourceGroups/rg-excluded/providers/Microsoft.Advisor/configurations/default',
+                name: 'rg-excluded',
+                type: 'Microsoft.Advisor/configurations',
+                subscriptionId: 'sub-one',
+                resourceGroup: 'rg-excluded',
+                properties: { exclude: true },
+              },
+            ],
+          })
+        }
+        if (query.includes('microsoft.advisor/recommendations')) {
+          expect(query).toContain(
+            "tostring(properties.recommendationStatus) in~ ('New', 'Active', 'InProgress')",
+          )
+          expect(query).not.toContain(
+            'isempty(properties.recommendationStatus)',
+          )
+          return jsonResponse({
+            data: [
+              advisor('active', 'New'),
+              advisor('legacy', undefined),
+              advisor(
+                'low-below',
+                'New',
+                'rg-test',
+                'e10b1381-5f0a-47ff-8c7b-37bd13d7c974',
+                '4',
+              ),
+              advisor(
+                'low-above',
+                'New',
+                'rg-test',
+                'e10b1381-5f0a-47ff-8c7b-37bd13d7c974',
+                '6',
+              ),
+              advisor(
+                'low-missing',
+                'New',
+                'rg-test',
+                '94aea435-ef39-493f-a547-8408092c22a7',
+                null,
+              ),
+              advisor('dismissed', 'Dismissed'),
+              advisor('postponed', 'Postponed'),
+              advisor('excluded', 'New', 'rg-excluded'),
+            ],
+          })
+        }
+        if (query.includes("type =~ 'microsoft.compute/virtualmachines'")) {
+          return jsonResponse({
+            data: [
+              vm('vm-uncovered'),
+              vm('vm-disabled'),
+              vm('vm-startup'),
+              vm('vm-covered'),
+              vm('vm-incomplete'),
+            ],
+          })
+        }
+        if (query.includes("type =~ 'microsoft.devtestlab/schedules'")) {
+          return jsonResponse({
+            data: [
+              schedule(
+                'shutdown-disabled',
+                vmId('vm-disabled'),
+                'Disabled',
+                'ComputeVmShutdownTask',
+              ),
+              schedule(
+                'startup-enabled',
+                vmId('vm-startup'),
+                'Enabled',
+                'ComputeVmStartupTask',
+              ),
+              schedule(
+                'shutdown-enabled',
+                vmId('vm-covered'),
+                'Enabled',
+                'ComputeVmShutdownTask',
+              ),
+              schedule(
+                'shutdown-missing-timezone',
+                vmId('vm-incomplete'),
+                'Enabled',
+                'ComputeVmShutdownTask',
+                false,
+              ),
+            ],
+          })
+        }
+        if (query.includes('summarize resourceCount')) {
+          return jsonResponse({
+            data: [{ subscriptionId: 'sub-one', resourceCount: 5 }],
+          })
+        }
+        return jsonResponse({ data: [] })
+      }
+      throw new Error(`Unexpected Azure request: ${url}`)
+    }) as typeof fetch
+    const credential: TokenCredential = {
+      async getToken() {
+        return {
+          token: 'test-token',
+          expiresOnTimestamp: Date.now() + 60_000,
+        }
+      },
+    }
+
+    const snapshot = await new AzureProvider(
+      credential,
+      'tenant-one',
+      { telemetryMaximumCandidates: 0 },
+    ).collect({ tenantId: 'tenant-one' })
+    const advisorFindings = snapshot.recommendations.filter(
+      (recommendation) => recommendation.source === 'advisor',
+    )
+    expect(advisorFindings.map((finding) => finding.sourceRecommendationId))
+      .toEqual(['active', 'low-below', 'low-missing'])
+    expect(advisorFindings[0]?.claim).toMatchObject({
+      level: 'azure_estimate',
+      validationState: 'azure_authored',
+      provenance: {
+        nativeStatus: 'New',
+        nativeImpact: 'High',
+        nativeRisk: 'Medium',
+        nativeLookbackDays: 30,
+        activityClassification: 'text_fallback',
+        extendedProperties: { MaxCpuP95: '4.2' },
+      },
+    })
+    expect(advisorFindings[1]?.claim.provenance.advisorConfiguration)
+      .toMatchObject({
+        source: 'Azure Advisor configuration',
+        scope: 'sub-one',
+        lowCpuThreshold: 5,
+      })
+    expect(advisorFindings[2]?.claim.missingEvidence.join(' ')).toContain(
+      'MaxCpuP95',
+    )
+
+    const scheduleFindings = snapshot.recommendations.filter(
+      (recommendation) =>
+        recommendation.activity === 'shutdown_scheduling',
+    )
+    expect(scheduleFindings.map((finding) => finding.resourceName).sort())
+      .toEqual([
+        'vm-disabled',
+        'vm-incomplete',
+        'vm-startup',
+        'vm-uncovered',
+      ])
+    expect(
+      scheduleFindings.every(
+        (finding) =>
+          finding.estimatedMonthlySavings === null &&
+          finding.azureEstimatedMonthlySavings === null &&
+          finding.calculatedMonthlySavings === null &&
+          finding.measuredMonthlySavings === null &&
+          finding.claim.level === 'investigation_lead' &&
+          finding.claim.formula === undefined,
+      ),
+    ).toBe(true)
+    expect(snapshot.subscriptions[0]?.potentialMonthlySavings).toBe(50)
+  })
+
+  it('enriches selected VM findings and reports observed telemetry coverage', async () => {
+    delete process.env.PROSPECTOR_SUBSCRIPTION_IDS
+    const vmId =
+      '/subscriptions/sub-one/resourceGroups/rg-test/providers/Microsoft.Compute/virtualMachines/vm-test'
+    const telemetryStart = new Date('2026-08-05T00:00:00.000Z')
+    const hourlyPoints = Array.from({ length: 720 }, (_, index) => ({
+      timeStamp: new Date(telemetryStart.getTime() + index * 3_600_000),
+      average: 1,
+      minimum: 1,
+      maximum: 1,
+      total: 100,
+      count: 60,
+    }))
+    globalThis.fetch = vi.fn(async (input, init) => {
+      const url = String(input)
+      if (url.includes('/subscriptions?')) {
+        return jsonResponse({
+          value: [
+            {
+              subscriptionId: 'sub-one',
+              displayName: 'Subscription one',
+              state: 'Enabled',
+              tenantId: 'tenant-one',
+            },
+          ],
+        })
+      }
+      if (url.includes('/Microsoft.CostManagement/query')) {
+        return jsonResponse({
+          properties: {
+            columns: [
+              { name: 'PreTaxCost' },
+              { name: 'ResourceId' },
+              { name: 'BillingMonth' },
+              { name: 'Currency' },
+              { name: 'PricingModel' },
+            ],
+            rows: [[300, vmId, '202608', 'GBP', 'OnDemand']],
+          },
+        })
+      }
+      if (url.includes('/providers/Microsoft.Insights/metrics?')) {
+        const requestUrl = new URL(url)
+        expect(requestUrl.searchParams.get('metricnames')).toBe(
+          'VmAvailabilityMetric',
+        )
+        expect(requestUrl.searchParams.get('interval')).toBe('PT1H')
+        expect(requestUrl.searchParams.get('aggregation')).toBe(
+          'Average,Minimum,Maximum',
+        )
+        expect(requestUrl.searchParams.get('timespan')).toBe(
+          '2026-08-05T00:00:00.000Z/2026-09-04T00:00:00.000Z',
+        )
+        expect(requestUrl.searchParams.has('$filter')).toBe(false)
+        return jsonResponse({
+          value: [
+            {
+              id: `${vmId}/providers/Microsoft.Insights/metrics/VmAvailabilityMetric`,
+              type: 'Microsoft.Insights/metrics',
+              name: {
+                value: 'VmAvailabilityMetric',
+                localizedValue: 'VM Availability Metric',
+              },
+              unit: 'Count',
+              timeseries: [
+                {
+                  metadatavalues: [
+                    {
+                      name: {
+                        value: 'Context',
+                        localizedValue: 'Context',
+                      },
+                      value: 'Customer',
+                    },
+                  ],
+                  data: hourlyPoints.map((point) => ({
+                    timeStamp: point.timeStamp.toISOString(),
+                    average: point.average,
+                    minimum: point.minimum,
+                    maximum: point.maximum,
+                  })),
+                },
+              ],
+            },
+          ],
+        })
+      }
+      if (url.includes('/eventtypes/management/values')) {
+        return jsonResponse({
+          value: [
+            {
+              eventTimestamp: '2026-08-10T08:00:00.000Z',
+              operationName: {
+                value: 'Microsoft.Compute/virtualMachines/start/action',
+              },
+              status: { value: 'Succeeded' },
+              correlationId: 'correlation-one',
+            },
+          ],
+        })
+      }
+      if (url.includes('/providers/Microsoft.ResourceGraph/resources')) {
+        const query = (JSON.parse(String(init?.body)) as { query: string }).query
+        if (query.includes('microsoft.advisor/configurations')) {
+          return jsonResponse({ data: [] })
+        }
+        if (query.includes('microsoft.advisor/recommendations')) {
+          return jsonResponse({
+            data: [
+              {
+                id: vmId,
+                advisorResourceId:
+                  '/subscriptions/sub-one/providers/Microsoft.Advisor/recommendations/right-size',
+                advisorRecommendationId: 'right-size',
+                name: 'vm-test',
+                type: 'Microsoft.Compute/virtualMachines',
+                subscriptionId: 'sub-one',
+                resourceGroup: 'rg-test',
+                location: 'uksouth',
+                tags: { environment: 'test' },
+                properties: {
+                  category: 'Cost',
+                  recommendationStatus: 'New',
+                  recommendationTypeId: 'unknown-right-size-type',
+                  lastUpdated: '2026-09-01T00:00:00.000Z',
+                  impactedField: 'Microsoft.Compute/virtualMachines',
+                  resourceMetadata: { resourceId: vmId },
+                  shortDescription: {
+                    solution: 'Right-size the underutilized VM',
+                    problem: 'The virtual machine is underutilized.',
+                  },
+                  extendedProperties: {
+                    savingsAmount: '50',
+                    savingsCurrency: 'GBP',
+                    lookbackPeriod: '30',
+                  },
+                },
+              },
+            ],
+          })
+        }
+        if (query.includes("type =~ 'microsoft.compute/virtualmachines'")) {
+          return jsonResponse({
+            data: [
+              {
+                id: vmId,
+                name: 'vm-test',
+                type: 'Microsoft.Compute/virtualMachines',
+                subscriptionId: 'sub-one',
+                resourceGroup: 'rg-test',
+                location: 'uksouth',
+                tags: { environment: 'test' },
+                properties: {},
+              },
+            ],
+          })
+        }
+        if (query.includes("type =~ 'microsoft.devtestlab/schedules'")) {
+          return jsonResponse({ data: [] })
+        }
+        if (query.includes('summarize resourceCount')) {
+          return jsonResponse({
+            data: [{ subscriptionId: 'sub-one', resourceCount: 1 }],
+          })
+        }
+        return jsonResponse({ data: [] })
+      }
+      throw new Error(`Unexpected Azure request: ${url}`)
+    }) as typeof fetch
+    const credential: TokenCredential = {
+      async getToken() {
+        return {
+          token: 'test-token',
+          expiresOnTimestamp: Date.now() + 60_000,
+        }
+      },
+    }
+    const snapshot = await new AzureProvider(
+      credential,
+      'tenant-one',
+      {
+        now: () => new Date('2026-09-04T12:30:00.000Z'),
+        telemetryMaximumAttempts: 1,
+        metricsClientFactory: () => ({
+          async queryResources(resources, metricNames) {
+            return resources.map((resourceId) => {
+              const metrics = metricNames.map((name) => ({
+                id: `${resourceId}/providers/microsoft.insights/metrics/${name}`,
+                type: 'Microsoft.Insights/metrics',
+                name,
+                unit:
+                  name === 'Percentage CPU'
+                    ? ('Percent' as const)
+                    : name === 'VmAvailabilityMetric'
+                      ? ('Count' as const)
+                      : ('Bytes' as const),
+                timeseries: [
+                  {
+                    metadatavalues:
+                      name === 'VmAvailabilityMetric'
+                        ? [{ name: 'Context', value: 'Customer' }]
+                        : [],
+                    data:
+                      name === 'Percentage CPU'
+                        ? hourlyPoints.map((point) => ({
+                            ...point,
+                            average: 5,
+                            minimum: 2,
+                            maximum: 8,
+                            total: undefined,
+                          }))
+                        : hourlyPoints,
+                  },
+                ],
+              }))
+              return {
+                resourceId,
+                resourceRegion: 'uksouth',
+                namespace: 'Microsoft.Compute/virtualMachines',
+                granularity: 'PT1H',
+                timespan: {
+                  startTime: telemetryStart,
+                  endTime: new Date('2026-09-04T00:00:00.000Z'),
+                },
+                metrics,
+                getMetricByName(name: string) {
+                  return metrics.find((metric) => metric.name === name)
+                },
+              }
+            })
+          },
+        }),
+      },
+    ).collect({ tenantId: 'tenant-one' })
+
+    const rightSize = snapshot.recommendations.find(
+      (recommendation) => recommendation.source === 'advisor',
+    )!
+    expect(rightSize).toMatchObject({
+      activity: 'right_sizing',
+      azureEstimatedMonthlySavings: 50,
+      calculatedMonthlySavings: null,
+      claim: {
+        level: 'azure_estimate',
+      },
+      vmTelemetry: {
+        guestMemoryStatus: 'not_collected',
+        availability: {
+          populatedBuckets: 720,
+          nearContinuousAvailability: true,
+          contextValues: ['Customer'],
+        },
+      },
+    })
+    expect(rightSize.claim.missingEvidence.join(' ')).toContain(
+      'Guest memory telemetry',
+    )
+    expect(
+      rightSize.evidence.find((item) => item.label === 'Hourly CPU p95')?.value,
+    ).toBe(5)
+
+    const schedule = snapshot.recommendations.find(
+      (recommendation) =>
+        recommendation.activity === 'shutdown_scheduling',
+    )!
+    expect(schedule.azureEstimatedMonthlySavings).toBeNull()
+    expect(schedule.calculatedMonthlySavings).toBeCloseTo(226.67, 2)
+    expect(schedule.claim).toMatchObject({
+      level: 'calculated_scenario',
+      decisionStatus: 'needs_validation',
+      validationState: 'deterministic_calculation',
+      ruleVersion: 'vm-schedule-8-hours-weekday-v1',
+      formula: {
+        expression:
+          'eligible_variable_vm_compute_cost * avoidable_observed_billable_hours / observed_billable_hours',
+      },
+    })
+    expect(schedule.vmTelemetry?.activityLog.events).toEqual([
+      {
+        operation: 'Microsoft.Compute/virtualMachines/start/action',
+        status: 'Succeeded',
+        timestamp: '2026-08-10T08:00:00.000Z',
+        correlationId: 'correlation-one',
+      },
+    ])
+    expect(
+      snapshot.coverage.find(
+        (coverage) => coverage.key === 'vm-platform-telemetry',
+      ),
+    ).toMatchObject({
+      percentage: 100,
+      status: 'complete',
+    })
+    expect(snapshot.subscriptions[0]?.potentialMonthlySavings).toBeCloseTo(
+      226.67,
+      2,
+    )
   })
 
   it('stops paginated cost collection at the configured QPU budget', async () => {

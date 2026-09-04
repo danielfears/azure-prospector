@@ -139,4 +139,174 @@ describe('SelectedAzureProvider', () => {
       'Subscription sub-two in Tenant tenant-two could not be scanned: Tenant sign-in is required',
     )
   })
+
+  it('binds VM telemetry clients to each subscription credential', async () => {
+    const subscriptions = [
+      subscription('sub-one', 'tenant-one'),
+      subscription('sub-two', 'tenant-two'),
+    ]
+    const credentials = new Map<string, TokenCredential>(
+      subscriptions.map((item) => [
+        item.tenantId,
+        {
+          async getToken() {
+            return {
+              token: `${item.tenantId}-token`,
+              expiresOnTimestamp: Date.now() + 60_000,
+            }
+          },
+        },
+      ]),
+    )
+    const credentialByToken = new Map(
+      subscriptions.map((item) => [
+        `${item.tenantId}-token`,
+        credentials.get(item.tenantId)!,
+      ]),
+    )
+    globalThis.fetch = vi.fn(async (input, init) => {
+      const url = String(input)
+      const authorization = new Headers(init?.headers).get('Authorization') ?? ''
+      const token = authorization.replace(/^Bearer\s+/i, '')
+      const tenant = token.replace(/-token$/, '')
+      const subscriptionId = tenant === 'tenant-one' ? 'sub-one' : 'sub-two'
+      if (url.includes('/subscriptions?')) {
+        return jsonResponse({
+          value: [
+            {
+              subscriptionId,
+              displayName: `Subscription ${subscriptionId}`,
+              state: 'Enabled',
+              tenantId: tenant,
+            },
+          ],
+        })
+      }
+      if (url.includes('/Microsoft.CostManagement/query')) {
+        return jsonResponse({
+          properties: {
+            columns: [
+              { name: 'PreTaxCost' },
+              { name: 'ResourceId' },
+              { name: 'BillingMonth' },
+              { name: 'Currency' },
+            ],
+            rows: [],
+          },
+        })
+      }
+      if (url.includes('/providers/Microsoft.Insights/metrics?')) {
+        if (tenant !== 'tenant-one') return jsonResponse({ value: [] })
+        const start = new Date('2026-08-05T00:00:00.000Z')
+        return jsonResponse({
+          value: [
+            {
+              id: `${url}/VmAvailabilityMetric`,
+              type: 'Microsoft.Insights/metrics',
+              name: { value: 'VmAvailabilityMetric' },
+              unit: 'Count',
+              timeseries: [
+                {
+                  data: Array.from({ length: 720 }, (_, index) => ({
+                    timeStamp: new Date(
+                      start.getTime() + index * 3_600_000,
+                    ).toISOString(),
+                    average: 1,
+                  })),
+                },
+              ],
+            },
+          ],
+        })
+      }
+      if (url.includes('/eventtypes/management/values')) {
+        return jsonResponse({ value: [] })
+      }
+      if (url.includes('/Microsoft.ResourceGraph/resources')) {
+        const query = (JSON.parse(String(init?.body)) as { query: string }).query
+        if (query.includes("type =~ 'microsoft.compute/virtualmachines'")) {
+          return jsonResponse({
+            data: [
+              {
+                id: `/subscriptions/${subscriptionId}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-test`,
+                name: 'vm-test',
+                type: 'Microsoft.Compute/virtualMachines',
+                subscriptionId,
+                resourceGroup: 'rg',
+                location: 'uksouth',
+                tags: { environment: 'test' },
+                properties: {},
+              },
+            ],
+          })
+        }
+        if (query.includes('summarize resourceCount')) {
+          return jsonResponse({
+            data: [{ subscriptionId, resourceCount: 1 }],
+          })
+        }
+        return jsonResponse({ data: [] })
+      }
+      throw new Error(`Unexpected Azure request: ${url}`)
+    }) as typeof fetch
+
+    const boundCredentials: TokenCredential[] = []
+    const provider = new SelectedAzureProvider(
+      {
+        async listSubscriptions() {
+          return subscriptions
+        },
+        credentialForSubscription(_subscriptionId, tenantId) {
+          return credentials.get(tenantId)!
+        },
+      },
+      {
+        telemetryMaximumAttempts: 1,
+        metricsClientFactory(_endpoint, credential) {
+          boundCredentials.push(credential)
+          return {
+            async queryResources(resources) {
+              return resources.map((resourceId) => ({
+                resourceId,
+                resourceRegion: 'uksouth',
+                namespace: 'Microsoft.Compute/virtualMachines',
+                granularity: 'PT1H',
+                timespan: {
+                  startTime: new Date('2026-08-05T00:00:00.000Z'),
+                  endTime: new Date('2026-09-04T00:00:00.000Z'),
+                },
+                metrics: [],
+                getMetricByName() {
+                  return undefined
+                },
+              }))
+            },
+          }
+        },
+      },
+    )
+    const snapshot = await provider.collect({
+      subscriptionIds: ['sub-one', 'sub-two'],
+    })
+
+    expect(snapshot.subscriptions).toHaveLength(2)
+    expect(new Set(boundCredentials)).toEqual(
+      new Set([...credentialByToken.values()]),
+    )
+    expect(
+      snapshot.coverage.find(
+        (coverage) => coverage.key === 'vm-platform-telemetry',
+      ),
+    ).toMatchObject({
+      percentage: 50,
+      status: 'partial',
+      coveredCount: 1,
+      totalCount: 2,
+    })
+    expect(
+      snapshot.coverage.find(
+        (coverage) => coverage.key === 'vm-platform-telemetry',
+      )?.description,
+    ).toContain('2 selected subscriptions in 2 tenants')
+  })
 })

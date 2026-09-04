@@ -6,7 +6,10 @@ import type {
   AzureSubscriptionOption,
   CoverageItem,
 } from '../../src/shared/types.js'
-import { AzureProvider } from './azure.js'
+import {
+  AzureProvider,
+  type AzureProviderOptions,
+} from './azure.js'
 import type {
   CurrencyCostTrend,
   ProspectorProvider,
@@ -42,9 +45,9 @@ function mergeCostTrends(
     Map<
       string,
       {
-        actualCost: number
-        optimizedCost: number
-        realizedSavings: number
+        observedAmortizedCost: number
+        opportunityScenarioCost: number
+        measuredSavings: number | null
       }
     >
   >()
@@ -53,13 +56,16 @@ function mergeCostTrends(
       const periods = totals.get(trend.currency) ?? new Map()
       for (const point of trend.points) {
         const current = periods.get(point.period) ?? {
-          actualCost: 0,
-          optimizedCost: 0,
-          realizedSavings: 0,
+          observedAmortizedCost: 0,
+          opportunityScenarioCost: 0,
+          measuredSavings: null,
         }
-        current.actualCost += point.actualCost
-        current.optimizedCost += point.optimizedCost
-        current.realizedSavings += point.realizedSavings
+        current.observedAmortizedCost += point.observedAmortizedCost
+        current.opportunityScenarioCost += point.opportunityScenarioCost
+        current.measuredSavings =
+          current.measuredSavings === null || point.measuredSavings === null
+            ? null
+            : current.measuredSavings + point.measuredSavings
         periods.set(point.period, current)
       }
       totals.set(trend.currency, periods)
@@ -71,7 +77,13 @@ function mergeCostTrends(
       currency,
       points: [...periods.entries()]
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([period, values]) => ({ period, ...values })),
+        .map(([period, values]) => ({
+          period,
+          ...values,
+          actualCost: values.observedAmortizedCost,
+          optimizedCost: values.opportunityScenarioCost,
+          realizedSavings: values.measuredSavings ?? 0,
+        })),
     }))
 }
 
@@ -85,6 +97,12 @@ function mergeCoverage(snapshots: ProviderSnapshot[]): CoverageItem[] {
     (sum, snapshot) => sum + snapshot.subscriptions.length,
     0,
   )
+  const tenantCount =
+    new Set(
+      snapshots
+        .map((snapshot) => snapshot.tenantId)
+        .filter((tenantId): tenantId is string => Boolean(tenantId)),
+    ).size || snapshots.length
   const coverage: CoverageItem[] = []
   for (const key of [...keys].sort()) {
     const items = snapshots.flatMap((snapshot) => {
@@ -95,12 +113,27 @@ function mergeCoverage(snapshots: ProviderSnapshot[]): CoverageItem[] {
     })
     const first = items[0]?.item
     if (!first) continue
-    const percentage = totalSubscriptions
-      ? items.reduce(
-          (sum, { item, weight }) => sum + item.percentage * weight,
-          0,
-        ) / totalSubscriptions
-      : 0
+    const coveredCount = items.reduce(
+      (sum, { item }) => sum + (item.coveredCount ?? 0),
+      0,
+    )
+    const totalCount = items.reduce(
+      (sum, { item }) => sum + (item.totalCount ?? 0),
+      0,
+    )
+    const hasCountCoverage = items.every(
+      ({ item }) =>
+        item.coveredCount !== undefined && item.totalCount !== undefined,
+    )
+    const percentage =
+      hasCountCoverage && totalCount > 0
+        ? (coveredCount / totalCount) * 100
+        : totalSubscriptions
+          ? items.reduce(
+              (sum, { item, weight }) => sum + item.percentage * weight,
+              0,
+            ) / totalSubscriptions
+          : 0
     const action = items.find(({ item }) => item.action)?.item.action
     const unavailable = items.every(
       ({ item }) => item.status === 'unavailable',
@@ -111,7 +144,9 @@ function mergeCoverage(snapshots: ProviderSnapshot[]): CoverageItem[] {
       description:
         snapshots.length === 1
           ? first.description
-          : `${Math.round(percentage)}% coverage across ${totalSubscriptions} selected subscriptions in ${snapshots.length} tenants.`,
+          : hasCountCoverage && totalCount > 0
+            ? `${coveredCount} of ${totalCount} selected evidence targets met the coverage threshold across ${totalSubscriptions} selected subscriptions in ${tenantCount} ${tenantCount === 1 ? 'tenant' : 'tenants'}.`
+            : `${Math.round(percentage)}% coverage across ${totalSubscriptions} selected subscriptions in ${tenantCount} ${tenantCount === 1 ? 'tenant' : 'tenants'}.`,
       percentage,
       status: unavailable
         ? 'unavailable'
@@ -121,6 +156,7 @@ function mergeCoverage(snapshots: ProviderSnapshot[]): CoverageItem[] {
             ? 'partial'
             : 'missing',
       source: first.source,
+      ...(hasCountCoverage ? { coveredCount, totalCount } : {}),
       ...(action ? { action } : {}),
     })
   }
@@ -133,6 +169,7 @@ export class SelectedAzureProvider implements ProspectorProvider {
 
   constructor(
     private readonly authentication: SelectedAzureAuthentication,
+    private readonly azureProviderOptions: AzureProviderOptions = {},
   ) {}
 
   async collect(request: ProviderCollectRequest): Promise<ProviderSnapshot> {
@@ -171,6 +208,7 @@ export class SelectedAzureProvider implements ProspectorProvider {
         const snapshot = await new AzureProvider(
           credential,
           subscription.tenantId,
+          this.azureProviderOptions,
         ).collect({
           tenantId: subscription.tenantId,
           subscriptionIds: [subscription.id],

@@ -56,7 +56,36 @@ function liveSnapshot(tenantId: string, suffix: string): ProviderSnapshot {
 }
 
 describe('ProspectorStore', () => {
-  it('migrates legacy cost trends without losing realized savings', () => {
+  it('persists coverage evidence counts', () => {
+    const store = new ProspectorStore(':memory:', { seed: false })
+    try {
+      const snapshot = createDemoSnapshot(
+        new Date('2026-09-01T12:00:00.000Z'),
+      )
+      const coverageKey = snapshot.coverage[0]!.key
+      snapshot.coverage[0] = {
+        ...snapshot.coverage[0]!,
+        coveredCount: 3,
+        totalCount: 4,
+      }
+      const scan = store.startScan('demo', 'demo')
+      store.upsertCollectedSnapshot(scan.id, snapshot)
+      store.finishScan(scan.id)
+
+      expect(
+        store
+          .getOverview()
+          .coverage.find((item) => item.key === coverageKey),
+      ).toMatchObject({
+        coveredCount: 3,
+        totalCount: 4,
+      })
+    } finally {
+      store.close()
+    }
+  })
+
+  it('does not present legacy trend values as measured savings', () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'prospector-store-'))
     const databasePath = path.join(directory, 'legacy.db')
     const legacy = new DatabaseSync(databasePath)
@@ -85,11 +114,23 @@ describe('ProspectorStore', () => {
       expect(overview.savings.byCurrency[0]?.costTrend).toEqual([
         {
           period: '2026-08',
+          observedAmortizedCost: 100,
+          opportunityScenarioCost: 100,
+          measuredSavings: null,
           actualCost: 100,
           optimizedCost: 100,
-          realizedSavings: 10,
+          realizedSavings: 0,
         },
       ])
+      expect(overview.savings.measuredResultCount).toBe(0)
+      expect(overview.savings.measuredResultCoverage).toBeNull()
+      expect(overview.savings.measurementCoverage).toBe(0)
+      expect(overview.savings.verifiedMeasurementCount).toBe(0)
+      expect(overview.savings.byCurrency[0]).toMatchObject({
+        realizedSavingsLast30Days: 0,
+        realizedSavingsAllTime: 0,
+        verifiedMeasurementCount: 0,
+      })
     } finally {
       store.close()
       rmSync(directory, { recursive: true, force: true })
@@ -150,9 +191,14 @@ describe('ProspectorStore', () => {
 
     const migrated = new ProspectorStore(databasePath, { seed: false })
     try {
-      expect(migrated.listRecommendations()[0]?.activity).toBe(
-        'shutdown_scheduling',
-      )
+      expect(migrated.listRecommendations()[0]).toMatchObject({
+        activity: 'shutdown_scheduling',
+        estimatedMonthlySavings: null,
+        claim: {
+          level: 'investigation_lead',
+          provenance: { activityClassification: 'legacy_migration' },
+        },
+      })
       migrated.activateAssessment(reservedScan.assessmentId!)
       expect(migrated.listRecommendations()[0]?.activity).toBe(
         'reserved_instances',
@@ -213,6 +259,150 @@ describe('ProspectorStore', () => {
       expect(migrated.listRecommendations()[0]?.activity).toBe(
         'reserved_instances',
       )
+    } finally {
+      migrated.close()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('migrates legacy zero sentinels conservatively in active and saved workspaces', () => {
+    const directory = mkdtempSync(
+      path.join(tmpdir(), 'prospector-financial-availability-'),
+    )
+    const databasePath = path.join(directory, 'legacy.db')
+    const initialStore = new ProspectorStore(databasePath, { seed: false })
+    const knownSnapshot = createDemoSnapshot(
+      new Date('2026-09-01T12:00:00.000Z'),
+    )
+    const known = knownSnapshot.recommendations[0]!
+    known.estimatedMonthlySavings = 0
+    known.azureEstimatedMonthlySavings = 0
+    known.currentMonthlyCost = 0
+    known.currency = 'GBP'
+    known.evidence = [
+      {
+        label: 'Estimated monthly savings',
+        value: 0,
+        unit: 'GBP',
+        source: 'Azure Advisor',
+      },
+      {
+        label: 'Median completed-month amortized cost',
+        value: 0,
+        unit: 'GBP',
+        source: 'Cost Management',
+      },
+    ]
+    knownSnapshot.recommendations = [known]
+    knownSnapshot.subscriptions = [
+      {
+        ...knownSnapshot.subscriptions[0]!,
+        monthlyCost: 0,
+        currency: 'GBP',
+      },
+    ]
+    const knownScan = initialStore.startScan(
+      'demo',
+      'demo',
+      undefined,
+      'Known zero',
+    )
+    initialStore.completeScan(knownScan.id, knownSnapshot)
+
+    const ambiguousSnapshot = createDemoSnapshot(
+      new Date('2026-09-02T12:00:00.000Z'),
+    )
+    const ambiguous = {
+      ...ambiguousSnapshot.recommendations[0]!,
+      id: 'legacy_ambiguous_zero',
+      fingerprint: 'legacy_ambiguous_zero',
+      estimatedMonthlySavings: 0,
+      azureEstimatedMonthlySavings: 0,
+      currentMonthlyCost: 0,
+      currency: 'USD',
+      evidence: [],
+    }
+    ambiguousSnapshot.recommendations = [ambiguous]
+    ambiguousSnapshot.subscriptions = [
+      {
+        ...ambiguousSnapshot.subscriptions[0]!,
+        monthlyCost: 0,
+        currency: 'USD',
+      },
+    ]
+    const ambiguousScan = initialStore.startScan(
+      'demo',
+      'demo',
+      undefined,
+      'Ambiguous zero',
+    )
+    initialStore.completeScan(ambiguousScan.id, ambiguousSnapshot)
+    initialStore.close()
+
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec(`
+      UPDATE recommendations
+      SET claim_json = '{}',
+        evidence_json = '[]',
+        estimated_monthly_savings = 0,
+        current_monthly_cost = 0,
+        currency = 'USD',
+        savings_amount_available = 1,
+        current_cost_available = 1,
+        currency_available = 0;
+      UPDATE subscriptions
+      SET monthly_cost = 0,
+        currency = 'USD',
+        monthly_cost_available = 1,
+        currency_available = 0;
+      DELETE FROM metadata
+      WHERE key = 'schema_financial_availability_v2';
+    `)
+    const knownAssessment = legacy
+      .prepare('SELECT workspace_json FROM assessments WHERE id = ?')
+      .get(knownScan.assessmentId!) as { workspace_json: string }
+    const workspace = JSON.parse(knownAssessment.workspace_json) as {
+      recommendations: Array<Record<string, unknown>>
+      subscriptions: Array<Record<string, unknown>>
+    }
+    const storedRecommendation = workspace.recommendations[0]!
+    storedRecommendation.claim_json = '{}'
+    storedRecommendation.estimated_monthly_savings = 0
+    storedRecommendation.current_monthly_cost = 0
+    storedRecommendation.currency = 'GBP'
+    storedRecommendation.evidence_json = JSON.stringify(known.evidence)
+    delete storedRecommendation.savings_amount_available
+    delete storedRecommendation.current_cost_available
+    delete storedRecommendation.currency_available
+    for (const subscription of workspace.subscriptions) {
+      subscription.monthly_cost = 0
+      subscription.currency = 'GBP'
+      delete subscription.monthly_cost_available
+      delete subscription.currency_available
+    }
+    legacy
+      .prepare('UPDATE assessments SET workspace_json = ? WHERE id = ?')
+      .run(JSON.stringify(workspace), knownScan.assessmentId!)
+    legacy.close()
+
+    const migrated = new ProspectorStore(databasePath, { seed: false })
+    try {
+      expect(migrated.getRecommendation(ambiguous.id)).toMatchObject({
+        estimatedMonthlySavings: null,
+        currentMonthlyCost: null,
+        currency: null,
+      })
+      expect(migrated.getOverview().subscriptions[0]).toMatchObject({
+        monthlyCost: null,
+        currency: null,
+      })
+
+      migrated.activateAssessment(knownScan.assessmentId!)
+      expect(migrated.getRecommendation(known.id)).toMatchObject({
+        estimatedMonthlySavings: 0,
+        currentMonthlyCost: 0,
+        currency: 'GBP',
+      })
     } finally {
       migrated.close()
       rmSync(directory, { recursive: true, force: true })
@@ -298,12 +488,13 @@ describe('ProspectorStore', () => {
       expect(overview.savings.byCurrency[0]?.monthlyCost).toBe(86_520)
       expect(
         overview.savings.byCurrency[0]?.potentialMonthlySavings,
-      ).toBe(6887)
+      ).toBe(6689)
       expect(
         overview.savings.byCurrency[0]?.annualizedPotentialSavings,
-      ).toBe(82_644)
-      expect(overview.savings.verifiedMeasurementCount).toBe(6)
-      expect(overview.savings.measurementCoverage).toBe(100)
+      ).toBe(80_268)
+      expect(overview.savings.measuredResultCount).toBe(0)
+      expect(overview.savings.measuredResultCoverage).toBeNull()
+      expect(overview.savings.measurementCoverage).toBe(0)
       expect(overview.categories.find((item) => item.category === 'storage')).toEqual({
         category: 'storage',
         recommendations: 2,
@@ -313,9 +504,189 @@ describe('ProspectorStore', () => {
       expect(overview.recentScans).toHaveLength(1)
       expect(
         overview.savings.byCurrency[0]?.costTrend.every(
-          (point) => point.optimizedCost < point.actualCost,
+          (point) =>
+            point.opportunityScenarioCost < point.observedAmortizedCost &&
+            point.actualCost === point.observedAmortizedCost &&
+            point.optimizedCost === point.opportunityScenarioCost &&
+            point.realizedSavings === 0,
         ),
       ).toBe(true)
+    } finally {
+      store.close()
+    }
+  })
+
+  it('keeps unquantified schedule leads out of every potential total', () => {
+    const store = populatedStore()
+    try {
+      const schedule = store
+        .listRecommendations({ includeExcepted: true })
+        .find((recommendation) =>
+          recommendation.activity === 'shutdown_scheduling',
+        )
+      expect(schedule).toMatchObject({
+        estimatedMonthlySavings: null,
+        claim: {
+          level: 'investigation_lead',
+          decisionStatus: 'needs_evidence',
+          validationState: 'unvalidated',
+        },
+      })
+      expect(
+        store.getOverview().categories.find(
+          (category) => category.category === 'scheduling',
+        ),
+      ).toEqual({
+        category: 'scheduling',
+        recommendations: 1,
+        estimatedMonthlySavings: [],
+      })
+      expect(store.latestScan()?.estimatedMonthlySavingsByCurrency).toEqual([
+        { currency: 'USD', amount: 6689 },
+      ])
+    } finally {
+      store.close()
+    }
+  })
+
+  it('persists VM telemetry evidence with the normalized finding', () => {
+    const store = new ProspectorStore(':memory:', { seed: false })
+    try {
+      const snapshot = createDemoSnapshot(
+        new Date('2026-09-04T12:00:00.000Z'),
+      )
+      snapshot.recommendations[0]!.vmTelemetry = {
+        resourceId: snapshot.recommendations[0]!.resourceId!,
+        collectedAt: '2026-09-04T12:00:00.000Z',
+        window: {
+          startAt: '2026-08-05T00:00:00.000Z',
+          endAt: '2026-09-04T00:00:00.000Z',
+          interval: 'PT1H',
+          expectedBuckets: 720,
+        },
+        availability: {
+          expectedBuckets: 720,
+          populatedBuckets: 700,
+          unknownBuckets: 20,
+          missingDataPercentage: 20 / 7.2,
+          observedAvailableHours: 699,
+          knownAvailabilityPercentage: 99.86,
+          nearContinuousAvailability: true,
+          contextValues: ['Customer'],
+          caveat: 'Null availability remains unknown.',
+        },
+        metrics: [],
+        activityLog: { events: [] },
+        retrievalErrors: [],
+        guestMemoryStatus: 'not_collected',
+      }
+      const scan = store.startScan('demo', 'demo')
+      store.completeScan(scan.id, snapshot)
+
+      expect(
+        store.getRecommendation(snapshot.recommendations[0]!.id)?.vmTelemetry,
+      ).toEqual(snapshot.recommendations[0]!.vmTelemetry)
+    } finally {
+      store.close()
+    }
+  })
+
+  it('preserves telemetry-backed scheduling scenarios when restoring workspaces', () => {
+    const store = new ProspectorStore(':memory:', { seed: false })
+    try {
+      const firstSnapshot = createDemoSnapshot(
+        new Date('2026-09-04T12:00:00.000Z'),
+      )
+      const schedule = firstSnapshot.recommendations.find(
+        (recommendation) =>
+          recommendation.activity === 'shutdown_scheduling',
+      )!
+      schedule.estimatedMonthlySavings = 200
+      schedule.calculatedMonthlySavings = 200
+      schedule.claim = {
+        ...schedule.claim,
+        level: 'calculated_scenario',
+        decisionStatus: 'needs_validation',
+        validationState: 'deterministic_calculation',
+        ruleVersion: 'vm-schedule-8-hours-weekday-v1',
+        evidenceWindow: {
+          startAt: '2026-08-05T00:00:00.000Z',
+          endAt: '2026-09-04T00:00:00.000Z',
+          lookbackDays: 30,
+          description: 'Completed 30-day Azure Monitor window.',
+        },
+        provenance: {
+          ...schedule.claim.provenance,
+          sourceApi:
+            'Azure Resource Graph, Azure Monitor Metrics and Azure Activity Log',
+        },
+        formula: {
+          expression:
+            'eligible_variable_vm_compute_cost * avoidable_observed_billable_hours / observed_billable_hours',
+          inputs: [],
+          assumptions: ['Eight hours per weekday.'],
+          exclusions: ['Commitment effects.'],
+          ruleVersion: 'vm-schedule-8-hours-weekday-v1',
+        },
+      }
+      schedule.vmTelemetry = {
+        resourceId: schedule.resourceId!,
+        collectedAt: '2026-09-04T12:00:00.000Z',
+        window: {
+          startAt: '2026-08-05T00:00:00.000Z',
+          endAt: '2026-09-04T00:00:00.000Z',
+          interval: 'PT1H',
+          expectedBuckets: 720,
+        },
+        availability: {
+          expectedBuckets: 720,
+          populatedBuckets: 720,
+          unknownBuckets: 0,
+          missingDataPercentage: 0,
+          observedAvailableHours: 720,
+          knownAvailabilityPercentage: 100,
+          nearContinuousAvailability: true,
+          contextValues: ['Customer'],
+          caveat: 'Null remains unknown.',
+        },
+        metrics: [],
+        activityLog: { events: [] },
+        retrievalErrors: [],
+        guestMemoryStatus: 'not_collected',
+      }
+      const first = store.startScan(
+        'demo',
+        'demo',
+        undefined,
+        'First workspace',
+      )
+      store.completeScan(first.id, firstSnapshot)
+
+      const second = store.startScan(
+        'demo',
+        'demo',
+        undefined,
+        'Second workspace',
+      )
+      store.completeScan(second.id, createDemoSnapshot())
+      store.activateAssessment(first.assessmentId!)
+
+      const restored = store.getRecommendation(schedule.id)!
+      expect(restored).toMatchObject({
+        estimatedMonthlySavings: 200,
+        calculatedMonthlySavings: 200,
+        claim: {
+          level: 'calculated_scenario',
+          ruleVersion: 'vm-schedule-8-hours-weekday-v1',
+          formula: {
+            expression:
+              'eligible_variable_vm_compute_cost * avoidable_observed_billable_hours / observed_billable_hours',
+          },
+        },
+        vmTelemetry: {
+          availability: { populatedBuckets: 720 },
+        },
+      })
     } finally {
       store.close()
     }
@@ -429,6 +800,9 @@ describe('ProspectorStore', () => {
         points: [
           {
             period: '2026-08',
+            observedAmortizedCost: 100,
+            opportunityScenarioCost: 100,
+            measuredSavings: null,
             actualCost: 100,
             optimizedCost: 100,
             realizedSavings: 0,
@@ -456,13 +830,13 @@ describe('ProspectorStore', () => {
         {
           currency: 'USD',
           monthlyCost: 86_520,
-          potentialMonthlySavings: 6887,
+          potentialMonthlySavings: 6689,
         },
       ])
       expect(completed.estimatedMonthlySavings).toBe(0)
       expect(completed.estimatedMonthlySavingsByCurrency).toEqual([
         { currency: 'GBP', amount: 50 },
-        { currency: 'USD', amount: 6887 },
+        { currency: 'USD', amount: 6689 },
       ])
     } finally {
       store.close()
@@ -481,7 +855,7 @@ describe('ProspectorStore', () => {
         id: 'alternative_scenario',
         fingerprint: 'alternative_scenario_fingerprint',
         estimatedMonthlySavings:
-          original.estimatedMonthlySavings - 1,
+          (original.estimatedMonthlySavings ?? 0) - 1,
       })
       const scan = store.startScan('demo', 'demo')
       const completed = store.completeScan(scan.id, snapshot)
@@ -489,14 +863,14 @@ describe('ProspectorStore', () => {
       const overview = store.getOverview()
       expect(
         overview.savings.byCurrency[0]?.potentialMonthlySavings,
-      ).toBe(6887)
+      ).toBe(6689)
       expect(
         overview.categories.find(
           (item) => item.category === original.category,
         )?.recommendations,
       ).toBeGreaterThan(1)
       expect(completed.estimatedMonthlySavingsByCurrency).toEqual([
-        { currency: 'USD', amount: 6887 },
+        { currency: 'USD', amount: 6689 },
       ])
     } finally {
       store.close()

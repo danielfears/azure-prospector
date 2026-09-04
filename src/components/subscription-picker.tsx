@@ -222,7 +222,7 @@ export function SubscriptionPicker({
                             'text-[11px] font-semibold',
                             staleItems.length
                               ? 'text-destructive'
-                              : 'text-success',
+                              : 'text-primary',
                           )}
                         >
                           {refreshRequired
