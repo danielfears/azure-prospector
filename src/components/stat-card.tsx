@@ -11,6 +11,7 @@ interface StatCardProps {
   icon: LucideIcon
   trend?: number
   accent?: boolean
+  tone?: 'default' | 'opportunity' | 'outcome'
 }
 
 export function StatCard({
@@ -20,18 +21,31 @@ export function StatCard({
   icon: Icon,
   trend,
   accent = false,
+  tone = accent ? 'opportunity' : 'default',
 }: StatCardProps) {
   const improving = trend !== undefined && trend >= 0
+  const opportunity = tone === 'opportunity'
+  const outcome = tone === 'outcome'
 
   return (
-    <Card className={cn('overflow-hidden', accent && 'border-primary')}>
+    <Card
+      className={cn(
+        'overflow-hidden',
+        opportunity && 'border-primary',
+        outcome && 'border-success',
+      )}
+    >
       <CardContent className="p-5">
         <div className="mb-5 flex items-start justify-between gap-4">
           <span className="text-sm font-medium text-muted-foreground">{label}</span>
           <span
             className={cn(
               'flex size-9 items-center justify-center rounded-[0.625rem]',
-              accent ? 'bg-accent text-accent-foreground' : 'bg-secondary text-foreground',
+              opportunity
+                ? 'bg-accent text-accent-foreground'
+                : outcome
+                  ? 'bg-secondary text-success'
+                  : 'bg-secondary text-foreground',
             )}
           >
             <Icon className="size-4" aria-hidden="true" />
@@ -43,7 +57,11 @@ export function StatCard({
             <span
               className={cn(
                 'inline-flex items-center gap-0.5 font-semibold',
-                improving ? 'text-success' : 'text-destructive',
+                outcome
+                  ? 'text-success'
+                  : improving
+                    ? 'text-foreground'
+                    : 'text-destructive',
               )}
             >
               {improving ? (

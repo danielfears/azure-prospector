@@ -1,8 +1,10 @@
 import type {
   ActionStatus,
   ConfidenceBand,
+  MonetaryAmount,
   RecommendationCategory,
   RecommendationStatus,
+  SavingsActivity,
 } from '@/shared/types'
 
 export function formatCurrency(
@@ -18,6 +20,19 @@ export function formatCurrency(
   }).format(value)
 }
 
+export function formatCurrencyAmounts(
+  amounts: MonetaryAmount[],
+  compact = false,
+) {
+  if (!amounts.length) return 'No monetary data'
+  return [...amounts]
+    .sort((left, right) => left.currency.localeCompare(right.currency))
+    .map(({ amount, currency }) =>
+      formatCurrency(amount, currency, compact),
+    )
+    .join(' · ')
+}
+
 export function formatDate(value?: string, includeTime = false) {
   if (!value) return 'Not yet'
   return new Intl.DateTimeFormat(undefined, {
@@ -28,6 +43,23 @@ export function formatDate(value?: string, includeTime = false) {
 
 export function formatCategory(category: RecommendationCategory) {
   return category.charAt(0).toUpperCase() + category.slice(1)
+}
+
+const activityLabels: Record<SavingsActivity, string> = {
+  reserved_instances: 'Reserved Instances',
+  savings_plans: 'Savings Plans',
+  right_sizing: 'Right-sizing',
+  shutdown_scheduling: 'Shutdown scheduling',
+  orphan_cleanup: 'Orphan cleanup',
+  storage_optimization: 'Storage optimisation',
+  licensing_hybrid_benefit: 'Licensing & Hybrid Benefit',
+  database_optimization: 'Database optimisation',
+  network_optimization: 'Network optimisation',
+  other: 'Other',
+}
+
+export function formatActivity(activity: SavingsActivity) {
+  return activityLabels[activity]
 }
 
 export function formatStatus(status: RecommendationStatus) {

@@ -1,4 +1,9 @@
-import { AlertTriangle, CheckCircle2, CircleDashed } from 'lucide-react'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  CircleDashed,
+  LockKeyhole,
+} from 'lucide-react'
 
 import { Progress } from '@/components/ui/progress'
 import { cn } from '@/lib/utils'
@@ -12,6 +17,7 @@ const statusIcon = {
   complete: CheckCircle2,
   partial: CircleDashed,
   missing: AlertTriangle,
+  unavailable: LockKeyhole,
 }
 
 export function CoveragePanel({ coverage }: CoveragePanelProps) {
@@ -26,9 +32,11 @@ export function CoveragePanel({ coverage }: CoveragePanelProps) {
                 <Icon
                   className={cn(
                     'mt-0.5 size-4 shrink-0',
-                    item.status === 'complete' && 'text-success',
+                    item.status === 'complete' && 'text-foreground',
                     item.status === 'partial' && 'text-warning',
                     item.status === 'missing' && 'text-destructive',
+                    item.status === 'unavailable' &&
+                      'text-muted-foreground',
                   )}
                   aria-hidden="true"
                 />
@@ -37,13 +45,20 @@ export function CoveragePanel({ coverage }: CoveragePanelProps) {
                   <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
                     {item.description}
                   </div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    Source: {item.source}
+                  </div>
                 </div>
               </div>
               <span className="shrink-0 text-sm font-bold text-foreground">
-                {Math.round(item.percentage)}%
+                {item.status === 'unavailable'
+                  ? 'N/A'
+                  : `${Math.round(item.percentage)}%`}
               </span>
             </div>
-            <Progress value={item.percentage} />
+            {item.status !== 'unavailable' && (
+              <Progress value={item.percentage} />
+            )}
             {item.action && (
               <p className="mt-1.5 pl-6 text-xs text-muted-foreground">{item.action}</p>
             )}

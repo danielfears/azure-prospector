@@ -44,6 +44,10 @@ export class ScanService {
     }
   }
 
+  get isRunning(): boolean {
+    return this.running
+  }
+
   async run(input: StartScanRequest): Promise<ScanRecord> {
     if (this.running) throw new ScanInProgressError()
     this.running = true
@@ -53,14 +57,16 @@ export class ScanService {
         input.mode,
         providerName(input.mode),
         input.tenantId,
+        input.assessmentName,
+        input.assessmentId,
+        input.subscriptionIds ?? [],
       )
       const provider = this.providerFactories[input.mode](input)
       const snapshot = await provider.collect({
         tenantId: input.tenantId,
         subscriptionIds: input.subscriptionIds,
       })
-      this.store.upsertCollectedSnapshot(scan.id, snapshot)
-      return this.store.finishScan(scan.id)
+      return this.store.completeScan(scan.id, snapshot)
     } catch (error) {
       if (scan) this.store.failScan(scan.id, errorMessage(error))
       throw error

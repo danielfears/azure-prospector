@@ -3,6 +3,7 @@ import { realpath, stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import path from 'node:path'
 import { loadEnvFile } from 'node:process'
+import open from 'open'
 import { z, ZodError } from 'zod'
 import {
   recommendationCategories,
@@ -10,6 +11,17 @@ import {
   type ApiError,
   type HealthResponse,
 } from '../src/shared/types.js'
+import {
+  AzureAuthenticationRequiredError,
+  AzureAuthenticationService,
+} from './auth-service.js'
+import { SelectedAzureProvider } from './providers/selected-azure.js'
+import {
+  createAssessmentReport,
+  createAssessmentReportFilename,
+  createFindingsCsv,
+  serializeAssessmentReport,
+} from './report-export.js'
 import { ScanInProgressError, ScanService } from './scan-service.js'
 import { ProspectorStore, resolveDatabasePath } from './store.js'
 
@@ -31,16 +43,25 @@ try {
 const production = process.argv.includes('--production')
 const distributionRoot = path.resolve(projectRoot, 'dist')
 
-const startScanSchema = z
-  .object({
-    mode: z.enum(['demo', 'live']),
-    tenantId: z.string().trim().min(1).max(200).optional(),
-    subscriptionIds: z
-      .array(z.string().trim().min(1).max(200))
-      .max(1000)
-      .optional(),
-  })
-  .strict()
+const startScanSchema = z.discriminatedUnion('mode', [
+  z
+    .object({
+      mode: z.literal('demo'),
+      assessmentName: z.string().trim().min(1).max(120).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      mode: z.literal('live'),
+      assessmentId: z.string().uuid().optional(),
+      assessmentName: z.string().trim().min(1).max(120),
+      subscriptionIds: z
+        .array(z.string().trim().min(1).max(200))
+        .min(1)
+        .max(1000),
+    })
+    .strict(),
+])
 
 const createExceptionSchema = z
   .object({
@@ -114,6 +135,22 @@ function sendError(
   sendJson(response, status, payload)
 }
 
+function sendDownload(
+  response: ServerResponse,
+  contentType: string,
+  filename: string,
+  body: string,
+): void {
+  response.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  })
+  response.end(body)
+}
+
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const contentLength = Number(request.headers['content-length'] ?? 0)
   if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
@@ -167,15 +204,47 @@ function routeId(pathname: string, suffix = ''): string | undefined {
   }
 }
 
+function assessmentRouteId(
+  pathname: string,
+  suffix = '',
+): string | undefined {
+  const escapedSuffix = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = new RegExp(
+    `^/api/assessments/([^/]+)${escapedSuffix}$`,
+  ).exec(pathname)
+  if (!match?.[1]) return undefined
+  try {
+    return decodeURIComponent(match[1])
+  } catch {
+    throw new HttpError(400, 'Route contains an invalid identifier')
+  }
+}
+
 async function handleApi(
   request: IncomingMessage,
   response: ServerResponse,
   store: ProspectorStore,
   scans: ScanService,
+  authentication: AzureAuthenticationService,
 ): Promise<boolean> {
   const url = new URL(request.url ?? '/', 'http://localhost')
   if (!url.pathname.startsWith('/api/')) return false
   const method = request.method ?? 'GET'
+
+  if (method === 'GET' && url.pathname === '/api/auth/status') {
+    sendJson(response, 200, await authentication.getStatus())
+    return true
+  }
+
+  if (method === 'GET' && url.pathname === '/api/azure/subscriptions') {
+    sendJson(response, 200, await authentication.listSubscriptions())
+    return true
+  }
+
+  if (method === 'POST' && url.pathname === '/api/auth/login') {
+    sendJson(response, 200, await authentication.signInWithBrowser())
+    return true
+  }
 
   if (method === 'GET' && url.pathname === '/api/health') {
     const connection = store.getConnectionMetadata()
@@ -196,6 +265,102 @@ async function handleApi(
     return true
   }
 
+  if (method === 'GET' && url.pathname === '/api/assessments') {
+    sendJson(response, 200, store.listAssessments())
+    return true
+  }
+
+  const exportAssessmentId = assessmentRouteId(
+    url.pathname,
+    '/export',
+  )
+  if (method === 'GET' && exportAssessmentId) {
+    const assessment = store.getAssessment(exportAssessmentId)
+    if (!assessment) throw new HttpError(404, 'Assessment not found')
+    const overview = store.getOverview()
+    if (overview.estate.assessmentId !== exportAssessmentId) {
+      throw new HttpError(
+        409,
+        'Open the assessment before exporting it',
+      )
+    }
+    const format = z
+      .enum(['json', 'csv'])
+      .parse(url.searchParams.get('format') ?? 'json')
+    const exportedAt = new Date()
+    const filename = createAssessmentReportFilename(
+      assessment.name,
+      format,
+      exportedAt,
+    )
+    const recommendations = store.listRecommendations({
+      includeExcepted: true,
+    })
+    if (format === 'csv') {
+      sendDownload(
+        response,
+        'text/csv; charset=utf-8',
+        filename,
+        createFindingsCsv(recommendations),
+      )
+      return true
+    }
+    const report = createAssessmentReport(
+      {
+        assessment: {
+          id: assessment.id,
+          name: assessment.name,
+        },
+        overview,
+        recommendations,
+        actions: store.listActions(),
+        scans: store.getAssessmentScans(assessment.id),
+      },
+      { exportedAt },
+    )
+    sendDownload(
+      response,
+      'application/json; charset=utf-8',
+      filename,
+      serializeAssessmentReport(report),
+    )
+    return true
+  }
+
+  const assessmentId = assessmentRouteId(url.pathname)
+  if (method === 'POST' && assessmentId) {
+    if (scans.isRunning) {
+      throw new HttpError(
+        409,
+        'Wait for the running assessment to finish before opening another',
+      )
+    }
+    const assessment = store.getAssessment(assessmentId)
+    if (!assessment) throw new HttpError(404, 'Assessment not found')
+    if (assessment.status !== 'completed') {
+      throw new HttpError(409, 'Only completed assessments can be opened')
+    }
+    sendJson(response, 200, store.activateAssessment(assessmentId))
+    return true
+  }
+  if (method === 'DELETE' && assessmentId) {
+    if (scans.isRunning) {
+      throw new HttpError(
+        409,
+        'Wait for the running assessment to finish before deleting it',
+      )
+    }
+    if (!store.deleteAssessment(assessmentId)) {
+      throw new HttpError(404, 'Assessment not found')
+    }
+    response.writeHead(204, {
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    })
+    response.end()
+    return true
+  }
+
   if (method === 'GET' && url.pathname === '/api/recommendations') {
     const rawQuery = Object.fromEntries(url.searchParams.entries())
     const query = recommendationQuerySchema.parse(rawQuery)
@@ -210,6 +375,7 @@ async function handleApi(
 
   if (method === 'POST' && url.pathname === '/api/scans') {
     const input = startScanSchema.parse(await readJson(request))
+    if (input.mode === 'live') await authentication.ensureAuthenticated()
     const scan = await scans.run(input)
     sendJson(response, 201, scan)
     return true
@@ -389,8 +555,17 @@ async function serveProduction(
 }
 
 async function main(): Promise<void> {
-  const store = new ProspectorStore(resolveDatabasePath())
-  const scans = new ScanService(store)
+  const portValue = Number(process.env.PORT ?? 4310)
+  const port =
+    Number.isInteger(portValue) && portValue > 0 && portValue <= 65_535
+      ? portValue
+      : 4310
+  const host = process.env.HOST?.trim() || '127.0.0.1'
+  const store = new ProspectorStore(resolveDatabasePath(), { seed: false })
+  const authentication = new AzureAuthenticationService()
+  const scans = new ScanService(store, {
+    live: () => new SelectedAzureProvider(authentication),
+  })
   const vite = production
     ? undefined
     : await import('vite').then(({ createServer: createViteServer }) =>
@@ -403,7 +578,17 @@ async function main(): Promise<void> {
 
   const server = createServer((request, response) => {
     void (async () => {
-      if (await handleApi(request, response, store, scans)) return
+      if (
+        await handleApi(
+          request,
+          response,
+          store,
+          scans,
+          authentication,
+        )
+      ) {
+        return
+      }
       if (vite) {
         await new Promise<void>((resolve, reject) => {
           const finish = (): void => {
@@ -433,6 +618,8 @@ async function main(): Promise<void> {
       const status =
         error instanceof HttpError
           ? error.status
+          : error instanceof AzureAuthenticationRequiredError
+            ? 401
           : error instanceof ScanInProgressError
             ? 409
           : error instanceof ZodError
@@ -441,6 +628,8 @@ async function main(): Promise<void> {
       const message =
         error instanceof HttpError
           ? error.message
+          : error instanceof AzureAuthenticationRequiredError
+            ? 'Azure sign-in required'
           : error instanceof ScanInProgressError
             ? error.message
           : error instanceof ZodError
@@ -449,6 +638,8 @@ async function main(): Promise<void> {
       const details =
         error instanceof HttpError
           ? error.details
+          : error instanceof AzureAuthenticationRequiredError
+            ? error.message
           : error instanceof ZodError
             ? validationDetails(error)
             : undefined
@@ -464,17 +655,20 @@ async function main(): Promise<void> {
     })
   })
 
-  const portValue = Number(process.env.PORT ?? 4310)
-  const port =
-    Number.isInteger(portValue) && portValue > 0 && portValue <= 65_535
-      ? portValue
-      : 4310
-  const host = process.env.HOST?.trim() || '127.0.0.1'
   server.listen(port, host, () => {
     const connection = store.getConnectionMetadata()
+    const applicationUrl = `http://${host}:${port}`
     console.log(
-      `[azure-prospector] listening on http://${host}:${port} (${production ? 'production' : 'development'}, ${connection.mode} mode)`,
+      `[azure-prospector] listening on ${applicationUrl} (${production ? 'production' : 'development'}, ${connection.mode} mode)`,
     )
+    if (process.argv.includes('--open')) {
+      void open(applicationUrl).catch((error: unknown) => {
+        const errorName = error instanceof Error ? error.name : 'UnknownError'
+        console.error(
+          `[azure-prospector] could not open the browser (${errorName})`,
+        )
+      })
+    }
   })
 
   const shutdown = (): void => {

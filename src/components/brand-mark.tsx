@@ -11,13 +11,8 @@ export function BrandMark({ compact = false }: BrandMarkProps) {
         <Pickaxe className="size-5" aria-hidden="true" />
       </div>
       {!compact && (
-        <div className="min-w-0">
-          <div className="truncate text-[15px] font-bold tracking-[-0.01em] text-foreground">
-            Azure Prospector
-          </div>
-          <div className="truncate text-xs text-muted-foreground">
-            Cloud savings intelligence
-          </div>
+        <div className="truncate text-lg font-bold tracking-[-0.025em] text-foreground">
+          Azure Prospector
         </div>
       )}
     </div>
