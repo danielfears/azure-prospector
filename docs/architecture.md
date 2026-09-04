@@ -68,8 +68,22 @@ Every finding is converted into a common recommendation model with:
 - evidence with source and observation time;
 - owner plus ownership provenance;
 - exception and remediation relationships.
+- a deterministic savings activity describing the action required.
 
 Stable fingerprints allow repeated scans to update a finding rather than create duplicates.
+
+Savings activities are classified with explicit precedence so commitment
+options, right-sizing, schedule gaps, orphan cleanup, storage, licensing,
+database, and network work remain distinct from broad technical categories.
+Activity cards and report totals deduplicate alternative scenarios by affected
+resource and native currency. Reservation and savings-plan source scenarios
+remain available for detailed inspection and export.
+
+Schedule detection is intentionally narrower than uptime analysis. The current
+Resource Graph collector checks DevTest Lab auto-shutdown schedules; it does not
+cover Azure Automation or external schedulers and cannot prove historical 24/7
+runtime. That conclusion requires Azure Monitor platform or guest telemetry
+over a representative period.
 
 ### Persistence
 

@@ -33,6 +33,7 @@ Azure Prospector does not attempt to replace those systems. It provides a persis
 - Named, searchable multi-subscription cost assessments
 - Saved assessment collection with open, rescan, and confirmed delete actions
 - Complete JSON report and findings CSV exports
+- Clickable savings activities with resource-focused drill-down
 - Visible-subscription discovery
 - Azure Advisor cost recommendation ingestion
 - Azure Resource Graph orphan-resource checks
@@ -196,6 +197,28 @@ Confidence is evidence quality, not a promise that a change is safe.
 - **Low:** useful investigation lead where workload intent or external automation is unknown
 
 For example, an unattached managed disk with continuing cost is usually high-confidence. A VM without a visible auto-shutdown schedule is lower-confidence because an external scheduler may exist. Old blobs are not automatically considered deletable because retention, legal, backup, and workload intent cannot be inferred safely.
+
+Finding details explain the score in context. A quantified Advisor
+recommendation without a matching resource-level cost baseline is medium
+confidence: the source recommendation is authoritative, but its amount has not
+been independently corroborated by Prospector. Alternative reservation and
+savings-plan terms remain inspectable, while report totals and activity cards
+use each affected resource scope only once.
+
+## Savings activities
+
+The Overview groups findings by the action needed: Reserved Instances, Savings
+Plans, right-sizing, shutdown scheduling, orphan cleanup, storage optimisation,
+licensing and Azure Hybrid Benefit, database optimisation, network
+optimisation, and other findings. Selecting an activity opens the Findings view
+with that filter applied.
+
+Reservation and savings-plan activities show the highest-value Advisor scenario
+per affected resource scope; all source term and lookback scenarios remain in
+exports. Shutdown scheduling means no DevTest Lab auto-shutdown schedule was
+detected. It does not rule out Azure Automation or external schedulers, and it
+does not prove that a VM runs continuously—historical Azure Monitor evidence is
+required before Prospector can make that claim.
 
 ## Architecture
 

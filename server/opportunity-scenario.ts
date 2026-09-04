@@ -1,3 +1,8 @@
+import {
+  savingsOpportunityScopeKey,
+  type SavingsOpportunityScopeInput,
+} from '../src/shared/savings-activity.js'
+
 export interface OpportunityScenarioFinding {
   currency: string
   resourceId?: string
@@ -5,6 +10,11 @@ export interface OpportunityScenarioFinding {
   estimatedMonthlySavings: number
   currentMonthlyCost: number
   confidence: number
+  activity: SavingsOpportunityScopeInput['activity']
+  subscriptionId: string
+  title: string
+  resourceType: string
+  evidence?: SavingsOpportunityScopeInput['evidence']
 }
 
 export interface OpportunityScenarioSubscription {
@@ -26,7 +36,9 @@ export function calculateOpportunityReductionRatios(
       recommendation.currentMonthlyCost > 0
         ? Math.min(weightedSavings, recommendation.currentMonthlyCost)
         : weightedSavings
-    const key = `${recommendation.currency}:${recommendation.resourceId ?? recommendation.fingerprint}`
+    const key = `${recommendation.currency}:${savingsOpportunityScopeKey(
+      recommendation,
+    )}`
     bestSavingsByResource.set(
       key,
       Math.max(bestSavingsByResource.get(key) ?? 0, conservativeSavings),

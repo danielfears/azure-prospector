@@ -11,6 +11,21 @@ export const recommendationCategories = [
 
 export type RecommendationCategory = (typeof recommendationCategories)[number]
 
+export const savingsActivities = [
+  'reserved_instances',
+  'savings_plans',
+  'right_sizing',
+  'shutdown_scheduling',
+  'orphan_cleanup',
+  'storage_optimization',
+  'licensing_hybrid_benefit',
+  'database_optimization',
+  'network_optimization',
+  'other',
+] as const
+
+export type SavingsActivity = (typeof savingsActivities)[number]
+
 export const recommendationStatuses = [
   'open',
   'accepted',
@@ -72,6 +87,7 @@ export interface Recommendation {
   source: 'advisor' | 'resource_graph' | 'monitor' | 'cost_management' | 'prospector'
   sourceRecommendationId?: string
   category: RecommendationCategory
+  activity: SavingsActivity
   title: string
   description: string
   suggestedAction: string

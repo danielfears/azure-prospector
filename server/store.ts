@@ -16,6 +16,11 @@ import {
   type ScanRecord,
   type SubscriptionSummary,
 } from '../src/shared/types.js'
+import {
+  classifySavingsActivity,
+  isSavingsActivity,
+  savingsOpportunityScopeKey,
+} from '../src/shared/savings-activity.js'
 import { createDemoSnapshot } from './providers/demo.js'
 import { calculateOpportunityReductionRatios } from './opportunity-scenario.js'
 import type {
@@ -84,6 +89,24 @@ function parseJson<T>(value: unknown): T {
   return JSON.parse(asString(value)) as T
 }
 
+function recommendationActivity(
+  row: Row,
+  force = false,
+): Recommendation['activity'] {
+  if (!force && isSavingsActivity(row.activity)) return row.activity
+  return classifySavingsActivity({
+    title: asString(row.title),
+    description: asString(row.description),
+    category: asString(row.category),
+    resourceType: asString(row.resource_type ?? row.resourceType),
+  })
+}
+
+function normaliseRecommendationRow(row: Row, force = false): Row {
+  const activity = recommendationActivity(row, force)
+  return row.activity === activity ? row : { ...row, activity }
+}
+
 function activeExceptionJoin(alias = 'e'): string {
   return `LEFT JOIN exceptions ${alias}
     ON ${alias}.recommendation_id = r.id
@@ -100,8 +123,7 @@ function deduplicatedSavingsBy(
   const bestByResource = new Map<string, number>()
   for (const recommendation of recommendations) {
     const groupKey = group(recommendation)
-    const resourceKey =
-      recommendation.resourceId ?? recommendation.fingerprint
+    const resourceKey = savingsOpportunityScopeKey(recommendation)
     const key = `${groupKey}\u0000${resourceKey}`
     bestByResource.set(
       key,
@@ -221,6 +243,12 @@ export class ProspectorStore {
         source TEXT NOT NULL,
         source_recommendation_id TEXT,
         category TEXT NOT NULL,
+        activity TEXT NOT NULL DEFAULT 'other' CHECK (activity IN (
+          'reserved_instances', 'savings_plans', 'right_sizing',
+          'shutdown_scheduling', 'orphan_cleanup', 'storage_optimization',
+          'licensing_hybrid_benefit', 'database_optimization',
+          'network_optimization', 'other'
+        )),
         title TEXT NOT NULL,
         description TEXT NOT NULL,
         suggested_action TEXT NOT NULL,
@@ -393,6 +421,28 @@ export class ProspectorStore {
         'ALTER TABLE subscriptions ADD COLUMN tenant_id TEXT',
       )
     }
+    const recommendationColumns = this.database
+      .prepare('PRAGMA table_info(recommendations)')
+      .all() as Row[]
+    const activityColumnAdded = !recommendationColumns.some(
+      (column) => asString(column.name) === 'activity',
+    )
+    if (activityColumnAdded) {
+      this.database.exec(
+        `ALTER TABLE recommendations ADD COLUMN activity TEXT NOT NULL
+         DEFAULT 'other' CHECK (activity IN (
+           'reserved_instances', 'savings_plans', 'right_sizing',
+           'shutdown_scheduling', 'orphan_cleanup', 'storage_optimization',
+           'licensing_hybrid_benefit', 'database_optimization',
+           'network_optimization', 'other'
+         ))`,
+      )
+    }
+    const activityMigrationComplete =
+      this.getMetadata('schema_savings_activity_v1') === 'complete'
+    this.migrateSavingsActivities(
+      activityColumnAdded || !activityMigrationComplete,
+    )
     this.database.exec(`
       INSERT OR IGNORE INTO currency_cost_trend (
         provider, currency, period, actual_cost, optimized_cost,
@@ -425,12 +475,92 @@ export class ProspectorStore {
     this.migrateLegacyAssessment()
   }
 
+  private migrateSavingsActivities(forceActiveBackfill: boolean): void {
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const activeRows = this.database
+        .prepare(
+          `SELECT id, activity, title, description, category, resource_type
+           FROM recommendations`,
+        )
+        .all() as Row[]
+      const updateRecommendation = this.database.prepare(
+        'UPDATE recommendations SET activity = ? WHERE id = ?',
+      )
+      for (const row of activeRows) {
+        if (!forceActiveBackfill && isSavingsActivity(row.activity)) continue
+        updateRecommendation.run(
+          recommendationActivity(row, forceActiveBackfill),
+          asString(row.id),
+        )
+      }
+
+      const assessments = this.database
+        .prepare('SELECT id, workspace_json FROM assessments')
+        .all() as Row[]
+      const updateWorkspace = this.database.prepare(
+        'UPDATE assessments SET workspace_json = ? WHERE id = ?',
+      )
+      for (const assessment of assessments) {
+        let workspace: unknown
+        try {
+          workspace = JSON.parse(asString(assessment.workspace_json))
+        } catch {
+          continue
+        }
+        if (
+          !workspace ||
+          typeof workspace !== 'object' ||
+          Array.isArray(workspace)
+        ) {
+          continue
+        }
+        const recommendations = (workspace as Record<string, unknown>)
+          .recommendations
+        if (!Array.isArray(recommendations)) continue
+        let changed = false
+        const migratedRecommendations = recommendations.map((value) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) {
+            return value
+          }
+          const row = value as Row
+          const migrated = normaliseRecommendationRow(
+            row,
+            forceActiveBackfill,
+          )
+          if (migrated !== row) changed = true
+          return migrated
+        })
+        if (!changed) continue
+        updateWorkspace.run(
+          JSON.stringify({
+            ...(workspace as Record<string, unknown>),
+            recommendations: migratedRecommendations,
+          }),
+          asString(assessment.id),
+        )
+      }
+      if (forceActiveBackfill) {
+        this.setMetadata(
+          'schema_savings_activity_v1',
+          'complete',
+          new Date().toISOString(),
+        )
+      }
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   private captureWorkspace(): WorkspaceSnapshot {
     return {
       metadata: this.database
         .prepare(
           `SELECT * FROM metadata
-           WHERE key != 'active_assessment_id'`,
+           WHERE key != 'active_assessment_id'
+             AND key NOT LIKE 'schema_%'`,
         )
         .all() as Row[],
       subscriptions: this.database
@@ -469,7 +599,9 @@ export class ProspectorStore {
     ]) {
       this.database.exec(`DELETE FROM ${table}`)
     }
-    this.database.exec('DELETE FROM metadata')
+    this.database.exec(
+      "DELETE FROM metadata WHERE key NOT LIKE 'schema_%'",
+    )
   }
 
   private insertRows(table: string, rows: Row[]): void {
@@ -511,7 +643,10 @@ export class ProspectorStore {
   private restoreWorkspace(workspace: WorkspaceSnapshot): void {
     this.insertRows('metadata', workspace.metadata)
     this.insertRows('subscriptions', workspace.subscriptions)
-    this.insertRows('recommendations', workspace.recommendations)
+    this.insertRows(
+      'recommendations',
+      workspace.recommendations.map((row) => normaliseRecommendationRow(row)),
+    )
     this.insertRows('coverage', workspace.coverage)
     this.insertRows('currency_cost_trend', workspace.currencyCostTrend)
     this.insertRows('cost_trend', workspace.costTrend)
@@ -1236,7 +1371,7 @@ export class ProspectorStore {
       const recommendationStatement = this.database.prepare(`
         INSERT INTO recommendations (
           id, fingerprint, provider, source_family, source,
-          source_recommendation_id, category, title, description,
+          source_recommendation_id, category, activity, title, description,
           suggested_action, tenant_id, subscription_id, subscription_name,
           resource_id, resource_name, resource_type, resource_group, location,
           estimated_monthly_savings, current_monthly_cost, currency, confidence,
@@ -1245,7 +1380,7 @@ export class ProspectorStore {
           last_seen_at, resolved_at, last_scan_id
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           fingerprint = excluded.fingerprint,
@@ -1254,6 +1389,7 @@ export class ProspectorStore {
           source = excluded.source,
           source_recommendation_id = excluded.source_recommendation_id,
           category = excluded.category,
+          activity = excluded.activity,
           title = excluded.title,
           description = excluded.description,
           suggested_action = excluded.suggested_action,
@@ -1343,16 +1479,10 @@ export class ProspectorStore {
       }
 
       const estimatedSavingsByCurrency = [
-        ...snapshot.recommendations
-          .reduce((totals, item) => {
-            totals.set(
-              item.currency,
-              (totals.get(item.currency) ?? 0) +
-                item.estimatedMonthlySavings,
-            )
-            return totals
-          }, new Map<string, number>())
-          .entries(),
+        ...deduplicatedSavingsBy(
+          snapshot.recommendations,
+          (recommendation) => recommendation.currency,
+        ).entries(),
       ]
         .map(([currency, amount]) => ({ currency, amount }))
         .sort((left, right) =>
@@ -1419,6 +1549,9 @@ export class ProspectorStore {
       item.source,
       item.sourceRecommendationId ?? null,
       item.category,
+      isSavingsActivity(item.activity)
+        ? item.activity
+        : classifySavingsActivity(item),
       item.title,
       item.description,
       item.suggestedAction,
@@ -1571,6 +1704,7 @@ export class ProspectorStore {
       source: asString(row.source) as Recommendation['source'],
       sourceRecommendationId: asOptionalString(row.source_recommendation_id),
       category: asString(row.category) as Recommendation['category'],
+      activity: recommendationActivity(row),
       title: asString(row.title),
       description: asString(row.description),
       suggestedAction: asString(row.suggested_action),

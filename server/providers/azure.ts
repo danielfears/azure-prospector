@@ -12,6 +12,7 @@ import type {
   RecommendationCategory,
   RecommendationOwner,
 } from '../../src/shared/types.js'
+import { classifySavingsActivity } from '../../src/shared/savings-activity.js'
 import type {
   ProspectorProvider,
   ProviderCollectRequest,
@@ -398,6 +399,12 @@ function makeRecommendation(input: {
     sourceFamily: input.sourceFamily,
     sourceRecommendationId: input.sourceRecommendationId,
     category: input.category,
+    activity: classifySavingsActivity({
+      title: input.title,
+      description: input.description,
+      category: input.category,
+      resourceType: input.resource.type,
+    }),
     title: input.title,
     description: input.description,
     suggestedAction: input.suggestedAction,

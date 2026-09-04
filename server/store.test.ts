@@ -96,6 +96,129 @@ describe('ProspectorStore', () => {
     }
   })
 
+  it('backfills savings activities in active and saved assessment workspaces', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'prospector-activity-'))
+    const databasePath = path.join(directory, 'legacy.db')
+    const initialStore = new ProspectorStore(databasePath, { seed: false })
+    const reservedSnapshot = liveSnapshot('tenant-a', 'reserved')
+    Object.assign(reservedSnapshot.recommendations[0]!, {
+      category: 'commitment',
+      title: 'Purchase reserved instances for stable VM demand',
+      description: 'Commit to predictable virtual machine usage.',
+    })
+    const reservedScan = initialStore.startScan(
+      'live',
+      'azure',
+      'tenant-a',
+      'Reserved assessment',
+    )
+    initialStore.completeScan(reservedScan.id, reservedSnapshot)
+
+    const scheduleSnapshot = liveSnapshot('tenant-b', 'schedule')
+    Object.assign(scheduleSnapshot.recommendations[0]!, {
+      category: 'scheduling',
+      title: 'Review VM shutdown schedule coverage',
+      description: 'No matching auto-shutdown schedule was found.',
+    })
+    const scheduleScan = initialStore.startScan(
+      'live',
+      'azure',
+      'tenant-b',
+      'Schedule assessment',
+    )
+    initialStore.completeScan(scheduleScan.id, scheduleSnapshot)
+    initialStore.close()
+
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec('ALTER TABLE recommendations DROP COLUMN activity')
+    const assessmentRows = legacy
+      .prepare('SELECT id, workspace_json FROM assessments')
+      .all() as Array<{ id: string; workspace_json: string }>
+    const updateWorkspace = legacy.prepare(
+      'UPDATE assessments SET workspace_json = ? WHERE id = ?',
+    )
+    for (const assessment of assessmentRows) {
+      const workspace = JSON.parse(assessment.workspace_json) as {
+        recommendations?: Array<Record<string, unknown>>
+      }
+      for (const recommendation of workspace.recommendations ?? []) {
+        delete recommendation.activity
+      }
+      updateWorkspace.run(JSON.stringify(workspace), assessment.id)
+    }
+    legacy.close()
+
+    const migrated = new ProspectorStore(databasePath, { seed: false })
+    try {
+      expect(migrated.listRecommendations()[0]?.activity).toBe(
+        'shutdown_scheduling',
+      )
+      migrated.activateAssessment(reservedScan.assessmentId!)
+      expect(migrated.listRecommendations()[0]?.activity).toBe(
+        'reserved_instances',
+      )
+    } finally {
+      migrated.close()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('retries activity backfill when the migration marker is absent', () => {
+    const directory = mkdtempSync(
+      path.join(tmpdir(), 'prospector-activity-retry-'),
+    )
+    const databasePath = path.join(directory, 'legacy.db')
+    const initialStore = new ProspectorStore(databasePath, { seed: false })
+    const snapshot = liveSnapshot('tenant-a', 'reserved')
+    Object.assign(snapshot.recommendations[0]!, {
+      category: 'commitment',
+      title: 'Purchase reserved instances for stable VM demand',
+      description: 'Commit to predictable virtual machine usage.',
+      activity: 'reserved_instances',
+    })
+    const scan = initialStore.startScan(
+      'live',
+      'azure',
+      'tenant-a',
+      'Interrupted migration',
+    )
+    initialStore.completeScan(scan.id, snapshot)
+    initialStore.close()
+
+    const interrupted = new DatabaseSync(databasePath)
+    interrupted.exec(`
+      UPDATE recommendations SET activity = 'other';
+      DELETE FROM metadata WHERE key = 'schema_savings_activity_v1';
+    `)
+    const assessment = interrupted
+      .prepare('SELECT id, workspace_json FROM assessments LIMIT 1')
+      .get() as { id: string; workspace_json: string }
+    const workspace = JSON.parse(assessment.workspace_json) as {
+      recommendations: Array<Record<string, unknown>>
+    }
+    for (const recommendation of workspace.recommendations) {
+      recommendation.activity = 'other'
+    }
+    interrupted
+      .prepare('UPDATE assessments SET workspace_json = ? WHERE id = ?')
+      .run(JSON.stringify(workspace), assessment.id)
+    interrupted.close()
+
+    const migrated = new ProspectorStore(databasePath, { seed: false })
+    try {
+      expect(migrated.listRecommendations()[0]?.activity).toBe(
+        'reserved_instances',
+      )
+      migrated.activateAssessment(scan.assessmentId!)
+      expect(migrated.listRecommendations()[0]?.activity).toBe(
+        'reserved_instances',
+      )
+    } finally {
+      migrated.close()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it('associates the complete matching legacy scan history', () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'prospector-history-'))
     const databasePath = path.join(directory, 'legacy.db')
@@ -361,7 +484,7 @@ describe('ProspectorStore', () => {
           original.estimatedMonthlySavings - 1,
       })
       const scan = store.startScan('demo', 'demo')
-      store.completeScan(scan.id, snapshot)
+      const completed = store.completeScan(scan.id, snapshot)
 
       const overview = store.getOverview()
       expect(
@@ -372,6 +495,9 @@ describe('ProspectorStore', () => {
           (item) => item.category === original.category,
         )?.recommendations,
       ).toBeGreaterThan(1)
+      expect(completed.estimatedMonthlySavingsByCurrency).toEqual([
+        { currency: 'USD', amount: 6887 },
+      ])
     } finally {
       store.close()
     }

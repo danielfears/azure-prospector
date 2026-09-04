@@ -25,6 +25,7 @@ function recommendation(
     source: 'advisor',
     sourceRecommendationId: 'advisor-1',
     category: 'compute',
+    activity: 'right_sizing',
     title: 'Resize the VM',
     description: 'The VM is underused.',
     suggestedAction: 'Select a smaller SKU.',
@@ -194,6 +195,7 @@ describe('assessment report export', () => {
     expect(report.schema).toBe(ASSESSMENT_REPORT_SCHEMA)
     expect(report.exportedAt).toBe(exportedAt)
     expect(report.findings).toHaveLength(1)
+    expect(report.findings[0]?.activity).toBe('right_sizing')
     expect(report.remediationActions).toHaveLength(1)
     expect(report.remediationActions[0]).toMatchObject({
       id: action.id,
@@ -281,6 +283,7 @@ describe('assessment report export', () => {
     ])
 
     expect(csv.startsWith(FINDINGS_CSV_COLUMNS.map(quoted).join(','))).toBe(true)
+    expect(csv).toContain('"compute","right_sizing"')
     expect(csv).toContain('"Quarterly, ""archive""\r\nreview"')
     expect(csv).toContain(
       '"\'=HYPERLINK(""https://example.test"")"',

@@ -5,6 +5,10 @@ import {
   createCostQueryPlan,
 } from './azure.js'
 import { calculateOpportunityReductionRatios } from '../opportunity-scenario.js'
+import {
+  classifySavingsActivity,
+  savingsOpportunityScopeKey,
+} from '../../src/shared/savings-activity.js'
 
 const originalFetch = globalThis.fetch
 const originalSubscriptionIds = process.env.PROSPECTOR_SUBSCRIPTION_IDS
@@ -58,11 +62,104 @@ function jsonResponse(
 }
 
 describe('AzureProvider', () => {
+  it.each([
+    {
+      expected: 'reserved_instances',
+      title: 'Purchase a reserved instance',
+      description: 'A savings plan is an alternative for less stable usage.',
+      category: 'commitment',
+      resourceType: 'Microsoft.Compute/virtualMachines',
+    },
+    {
+      expected: 'savings_plans',
+      title: 'Purchase an Azure savings plan',
+      description: 'This is more flexible than a VM reservation.',
+      category: 'commitment',
+      resourceType: 'Microsoft.Compute/virtualMachines',
+    },
+    {
+      expected: 'shutdown_scheduling',
+      title: 'Review VM schedule coverage',
+      description: 'No matching auto-shutdown schedule was found.',
+      category: 'compute',
+      resourceType: 'Microsoft.Compute/virtualMachines',
+    },
+    {
+      expected: 'orphan_cleanup',
+      title: 'Delete an unattached managed disk',
+      description: 'The disk is not attached to a virtual machine.',
+      category: 'storage',
+      resourceType: 'Microsoft.Compute/disks',
+    },
+    {
+      expected: 'orphan_cleanup',
+      title: 'Remove an unused public IP address',
+      description: 'The public IP has no IP configuration.',
+      category: 'network',
+      resourceType: 'Microsoft.Network/publicIPAddresses',
+    },
+    {
+      expected: 'orphan_cleanup',
+      title: 'Remove an unattached network interface',
+      description: 'The NIC has no virtual machine attachment.',
+      category: 'network',
+      resourceType: 'Microsoft.Network/networkInterfaces',
+    },
+    {
+      expected: 'right_sizing',
+      title: 'Right-size the underutilized virtual machine',
+      description: 'Select a smaller SKU.',
+      category: 'compute',
+      resourceType: 'Microsoft.Compute/virtualMachines',
+    },
+    {
+      expected: 'storage_optimization',
+      title: 'Move cold blobs to a lower-cost tier',
+      description: 'Use lifecycle management for the archive.',
+      category: 'storage',
+      resourceType: 'Microsoft.Storage/storageAccounts',
+    },
+    {
+      expected: 'licensing_hybrid_benefit',
+      title: 'Enable Azure Hybrid Benefit',
+      description: 'Apply eligible Windows Server licences.',
+      category: 'commitment',
+      resourceType: 'Microsoft.Compute/virtualMachines',
+    },
+    {
+      expected: 'database_optimization',
+      title: 'Optimise the database service tier',
+      description: 'Database utilization is consistently low.',
+      category: 'database',
+      resourceType: 'Microsoft.Sql/servers/databases',
+    },
+    {
+      expected: 'network_optimization',
+      title: 'Consolidate NAT gateways',
+      description: 'Reduce network charges.',
+      category: 'network',
+      resourceType: 'Microsoft.Network/natGateways',
+    },
+    {
+      expected: 'other',
+      title: 'Review resource tags',
+      description: 'Confirm ownership metadata.',
+      category: 'governance',
+      resourceType: 'Microsoft.Resources/resourceGroups',
+    },
+  ])('classifies $expected deterministically', ({ expected, ...input }) => {
+    expect(classifySavingsActivity(input)).toBe(expected)
+  })
+
   it('builds a confidence-weighted, per-resource opportunity scenario', () => {
     const ratios = calculateOpportunityReductionRatios(
       [
         {
           currency: 'GBP',
+          activity: 'right_sizing',
+          subscriptionId: 'sub-one',
+          title: 'Right-size VM',
+          resourceType: 'Microsoft.Compute/virtualMachines',
           resourceId: 'resource-one',
           fingerprint: 'finding-one',
           estimatedMonthlySavings: 200,
@@ -71,6 +168,10 @@ describe('AzureProvider', () => {
         },
         {
           currency: 'GBP',
+          activity: 'right_sizing',
+          subscriptionId: 'sub-one',
+          title: 'Right-size VM',
+          resourceType: 'Microsoft.Compute/virtualMachines',
           resourceId: 'resource-one',
           fingerprint: 'finding-two',
           estimatedMonthlySavings: 100,
@@ -79,6 +180,10 @@ describe('AzureProvider', () => {
         },
         {
           currency: 'USD',
+          activity: 'right_sizing',
+          subscriptionId: 'sub-two',
+          title: 'Right-size VM',
+          resourceType: 'Microsoft.Compute/virtualMachines',
           fingerprint: 'advisor-only',
           estimatedMonthlySavings: 500,
           currentMonthlyCost: 0,
@@ -93,6 +198,34 @@ describe('AzureProvider', () => {
 
     expect(ratios.get('GBP')).toBeCloseTo(0.16)
     expect(ratios.get('USD')).toBe(0)
+  })
+
+  it('uses one stable scope for alternative commitment scenarios', () => {
+    const base = {
+      activity: 'reserved_instances' as const,
+      subscriptionId: 'sub-one',
+      title: 'Consider App Service reserved instance',
+      resourceType: 'Microsoft.Subscriptions/subscriptions',
+      fingerprint: 'scenario-one',
+      evidence: [
+        { label: 'Recommended SKU', value: 'App_Service_I1_v2_linux' },
+        { label: 'Recommendation region', value: 'uksouth' },
+      ],
+    }
+    expect(
+      savingsOpportunityScopeKey({
+        ...base,
+        resourceId: '/advisor/recommendations/scenario-one',
+        title: `${base.title} (1 year, 7-day lookback)`,
+      }),
+    ).toBe(
+      savingsOpportunityScopeKey({
+        ...base,
+        fingerprint: 'scenario-two',
+        resourceId: '/advisor/recommendations/scenario-two',
+        title: `${base.title} (3 years, 60-day lookback)`,
+      }),
+    )
   })
 
   it('adapts cost history to the tenant QPU budget', () => {
@@ -244,6 +377,7 @@ describe('AzureProvider', () => {
       snapshot.currencyCostTrends.map((trend) => trend.currency),
     ).toEqual(['GBP', 'USD'])
     expect(snapshot.recommendations[0]?.currency).toBe('EUR')
+    expect(snapshot.recommendations[0]?.activity).toBe('right_sizing')
     expect(snapshot.recommendations[0]?.evidence).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

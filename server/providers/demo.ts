@@ -4,6 +4,7 @@ import type {
   RecommendationCategory,
   RecommendationOwner,
 } from '../../src/shared/types.js'
+import { classifySavingsActivity } from '../../src/shared/savings-activity.js'
 import type {
   ProspectorProvider,
   ProviderCollectRequest,
@@ -81,6 +82,7 @@ function recommendation(input: DemoRecommendationInput): SnapshotRecommendation 
     source: input.source,
     sourceFamily: `demo:${input.source}`,
     category: input.category,
+    activity: classifySavingsActivity(input),
     title: input.title,
     description: input.description,
     suggestedAction: input.suggestedAction,

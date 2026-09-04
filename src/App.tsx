@@ -36,6 +36,7 @@ import { CoveragePanel } from '@/components/coverage-panel'
 import { RecommendationDetail } from '@/components/recommendation-detail'
 import { RecommendationTable } from '@/components/recommendation-table'
 import { ScanProgress } from '@/components/scan-progress'
+import { SavingsActivityPanel } from '@/components/savings-activity-panel'
 import { StatCard } from '@/components/stat-card'
 import { SubscriptionPicker } from '@/components/subscription-picker'
 import { Badge } from '@/components/ui/badge'
@@ -59,6 +60,7 @@ import {
 } from '@/lib/api'
 import {
   formatCategory,
+  formatActivity,
   formatActionStatus,
   formatCurrency,
   formatCurrencyAmounts,
@@ -66,9 +68,11 @@ import {
   formatStatus,
 } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { savingsOpportunityScopeKey } from '@/shared/savings-activity'
 import {
   recommendationCategories,
   recommendationStatuses,
+  savingsActivities,
   type ActionStatus,
   type AssessmentSummary,
   type AuthStatusResponse,
@@ -81,6 +85,7 @@ import {
   type RecommendationCategory,
   type RecommendationStatus,
   type RemediationAction,
+  type SavingsActivity,
   type ScanMode,
 } from '@/shared/types'
 
@@ -111,8 +116,9 @@ function loadDashboardData() {
 function amountsByCurrency(
   recommendations: Recommendation[],
 ): MonetaryAmount[] {
+  const bestByResource = recommendationsByResource(recommendations)
   return [
-    ...recommendations
+    ...bestByResource
       .reduce((totals, recommendation) => {
         totals.set(
           recommendation.currency,
@@ -125,12 +131,31 @@ function amountsByCurrency(
   ].map(([currency, amount]) => ({ currency, amount }))
 }
 
+function recommendationsByResource(
+  recommendations: Recommendation[],
+): Recommendation[] {
+  const best = new Map<string, Recommendation>()
+  for (const recommendation of recommendations) {
+    const resourceKey = savingsOpportunityScopeKey(recommendation)
+    const key = `${recommendation.currency}\u0000${resourceKey}`
+    const current = best.get(key)
+    if (
+      !current ||
+      recommendation.estimatedMonthlySavings >
+        current.estimatedMonthlySavings
+    ) {
+      best.set(key, recommendation)
+    }
+  }
+  return [...best.values()]
+}
+
 function recommendationsByNativeValue(
   recommendations: Recommendation[],
   limit: number,
 ): Recommendation[] {
   const byCurrency = new Map<string, Recommendation[]>()
-  for (const recommendation of recommendations) {
+  for (const recommendation of recommendationsByResource(recommendations)) {
     const group = byCurrency.get(recommendation.currency) ?? []
     group.push(recommendation)
     byCurrency.set(recommendation.currency, group)
@@ -195,6 +220,7 @@ function App() {
   )
 
   const [search, setSearch] = useState('')
+  const [activity, setActivity] = useState<SavingsActivity | 'all'>('all')
   const [category, setCategory] = useState<RecommendationCategory | 'all'>('all')
   const [status, setStatus] = useState<StatusFilter>('active')
   const [subscriptionId, setSubscriptionId] = useState('all')
@@ -276,6 +302,7 @@ function App() {
       ) {
         return false
       }
+      if (activity !== 'all' && recommendation.activity !== activity) return false
       if (category !== 'all' && recommendation.category !== category) return false
       if (subscriptionId !== 'all' && recommendation.subscriptionId !== subscriptionId) {
         return false
@@ -294,6 +321,7 @@ function App() {
       return true
     })
   }, [
+    activity,
     category,
     includeExcepted,
     minimumConfidence,
@@ -469,6 +497,7 @@ function App() {
     setActiveView('overview')
     setSelected(undefined)
     setSearch('')
+    setActivity('all')
     setCategory('all')
     setStatus('active')
     setSubscriptionId('all')
@@ -531,6 +560,17 @@ function App() {
       : 'Connect Azure'
   const hasStoredAssessment = Boolean(overview?.estate.lastScanAt)
   const hasAssessment = workspaceOpen && hasStoredAssessment
+
+  function showSavingsActivity(nextActivity: SavingsActivity) {
+    setSearch('')
+    setActivity(nextActivity)
+    setCategory('all')
+    setStatus('active')
+    setSubscriptionId('all')
+    setMinimumConfidence(0)
+    setIncludeExcepted(false)
+    setActiveView('findings')
+  }
 
   async function addException(
     recommendationId: string,
@@ -853,9 +893,11 @@ function App() {
               {activeView === 'overview' && (
                 <OverviewView
                   overview={overview}
+                  recommendations={recommendations}
                   topRecommendations={topRecommendations}
                   onSelect={setSelected}
                   onNavigate={setActiveView}
+                  onSelectActivity={showSavingsActivity}
                 />
               )}
               {activeView === 'findings' && (
@@ -863,12 +905,14 @@ function App() {
                   overview={overview}
                   recommendations={filteredRecommendations}
                   search={search}
+                  activity={activity}
                   category={category}
                   status={status}
                   subscriptionId={subscriptionId}
                   minimumConfidence={minimumConfidence}
                   includeExcepted={includeExcepted}
                   onSearch={setSearch}
+                  onActivity={setActivity}
                   onCategory={setCategory}
                   onStatus={setStatus}
                   onSubscription={setSubscriptionId}
@@ -1211,14 +1255,18 @@ function WelcomeView({
 
 function OverviewView({
   overview,
+  recommendations,
   topRecommendations,
   onSelect,
   onNavigate,
+  onSelectActivity,
 }: {
   overview: OverviewResponse
+  recommendations: Recommendation[]
   topRecommendations: Recommendation[]
   onSelect: (recommendation: Recommendation) => void
   onNavigate: (view: View) => void
+  onSelectActivity: (activity: SavingsActivity) => void
 }) {
   const comparableSavings = overview.savings.byCurrency.filter(
     (summary) => summary.monthlyCost > 0,
@@ -1342,49 +1390,10 @@ function OverviewView({
             </div>
           </CardContent>
         </Card>
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center justify-between gap-3 text-base">
-              Opportunity seams
-              <Sparkles className="size-4 text-primary" aria-hidden="true" />
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {overview.categories
-              .filter((item) =>
-                item.estimatedMonthlySavings.some(
-                  (amount) => amount.amount > 0,
-                ),
-              )
-              .sort(
-                (left, right) =>
-                  right.recommendations - left.recommendations,
-              )
-              .slice(0, 6)
-              .map((item) => (
-                <div
-                  key={item.category}
-                  className="flex items-center justify-between gap-4 rounded-[0.625rem] border bg-secondary px-3 py-2.5"
-                >
-                  <div>
-                    <div className="text-sm font-semibold text-foreground">
-                      {formatCategory(item.category)}
-                    </div>
-                    <div className="mt-0.5 text-xs text-muted-foreground">
-                      {item.recommendations} findings
-                    </div>
-                  </div>
-                  <div className="text-right text-sm font-bold text-foreground">
-                    {formatCurrencyAmounts(
-                      item.estimatedMonthlySavings,
-                      true,
-                    )}
-                    <div className="text-[10px] font-normal text-muted-foreground">monthly</div>
-                  </div>
-                </div>
-              ))}
-          </CardContent>
-        </Card>
+        <SavingsActivityPanel
+          recommendations={recommendations}
+          onSelect={onSelectActivity}
+        />
       </div>
 
       <div className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.65fr)_minmax(320px,0.75fr)]">
@@ -1435,12 +1444,14 @@ function FindingsView({
   overview,
   recommendations,
   search,
+  activity,
   category,
   status,
   subscriptionId,
   minimumConfidence,
   includeExcepted,
   onSearch,
+  onActivity,
   onCategory,
   onStatus,
   onSubscription,
@@ -1451,12 +1462,14 @@ function FindingsView({
   overview: OverviewResponse
   recommendations: Recommendation[]
   search: string
+  activity: SavingsActivity | 'all'
   category: RecommendationCategory | 'all'
   status: StatusFilter
   subscriptionId: string
   minimumConfidence: number
   includeExcepted: boolean
   onSearch: (value: string) => void
+  onActivity: (value: SavingsActivity | 'all') => void
   onCategory: (value: RecommendationCategory | 'all') => void
   onStatus: (value: StatusFilter) => void
   onSubscription: (value: string) => void
@@ -1465,6 +1478,11 @@ function FindingsView({
   onSelect: (recommendation: Recommendation) => void
 }) {
   const totalValue = amountsByCurrency(recommendations)
+  const scenarioActivity =
+    activity === 'reserved_instances' || activity === 'savings_plans'
+  const displayedRecommendations = scenarioActivity
+    ? recommendationsByResource(recommendations)
+    : recommendations
 
   return (
     <div className="mx-auto max-w-[1500px]">
@@ -1476,8 +1494,9 @@ function FindingsView({
 
       <Card>
         <CardContent className="p-4 sm:p-5">
-          <div className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_repeat(4,minmax(140px,0.45fr))]">
-            <label className="relative">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1fr)_repeat(5,minmax(135px,0.45fr))]">
+            <label className="relative sm:col-span-2 xl:col-span-1">
+              <span className="sr-only">Search findings or resources</span>
               <Search
                 className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
                 aria-hidden="true"
@@ -1485,10 +1504,23 @@ function FindingsView({
               <input
                 className="h-10 w-full rounded-[0.625rem] border bg-card pl-9 pr-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
                 placeholder="Search findings or resources"
+                aria-label="Search findings or resources"
                 value={search}
                 onChange={(event) => onSearch(event.target.value)}
               />
             </label>
+            <FilterSelect
+              label="Activity"
+              value={activity}
+              onChange={(value) => onActivity(value as SavingsActivity | 'all')}
+            >
+              <option value="all">All activities</option>
+              {savingsActivities.map((item) => (
+                <option key={item} value={item}>
+                  {formatActivity(item)}
+                </option>
+              ))}
+            </FilterSelect>
             <FilterSelect
               label="Category"
               value={category}
@@ -1549,9 +1581,59 @@ function FindingsView({
         </CardContent>
       </Card>
 
+      {activity === 'shutdown_scheduling' && (
+        <div
+          className="mt-4 flex items-start gap-3 rounded-[0.625rem] border border-warning bg-secondary p-4"
+          role="status"
+        >
+          <AlertCircle
+            className="mt-0.5 size-4 shrink-0 text-warning"
+            aria-hidden="true"
+          />
+          <div>
+            <div className="text-sm font-bold text-foreground">
+              DevTest Lab schedule gap, not runtime proof
+            </div>
+            <p className="mt-1 text-sm leading-6 text-muted-foreground">
+              These VMs have no detected DevTest Lab auto-shutdown schedule.
+              This does not rule out Azure Automation or external schedulers,
+              and it does not prove 24/7 uptime. Historical Azure Monitor
+              telemetry is required to establish actual runtime.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {scenarioActivity &&
+        displayedRecommendations.length < recommendations.length && (
+          <div
+            className="mt-4 flex items-start gap-3 rounded-[0.625rem] border bg-secondary p-4"
+            role="status"
+          >
+            <AlertCircle
+              className="mt-0.5 size-4 shrink-0 text-primary"
+              aria-hidden="true"
+            />
+            <div>
+              <div className="text-sm font-bold text-foreground">
+                Highest-value scenario per resource scope
+              </div>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">
+                Showing {displayedRecommendations.length} affected resource
+                scopes from {recommendations.length} Advisor term and lookback
+                scenarios. All source scenarios remain available in the report
+                export.
+              </p>
+            </div>
+          </div>
+        )}
+
       <div className="my-4 flex flex-wrap items-center justify-between gap-3 text-sm">
         <span className="text-muted-foreground">
-          <strong className="text-foreground">{recommendations.length}</strong> findings
+          <strong className="text-foreground">
+            {displayedRecommendations.length}
+          </strong>{' '}
+          {scenarioActivity ? 'resource scopes' : 'findings'}
         </span>
         <span className="font-semibold text-foreground">
           {formatCurrencyAmounts(totalValue)} potential monthly value
@@ -1560,7 +1642,10 @@ function FindingsView({
 
       <Card>
         <CardContent className="p-2 sm:p-4">
-          <RecommendationTable recommendations={recommendations} onSelect={onSelect} />
+          <RecommendationTable
+            recommendations={displayedRecommendations}
+            onSelect={onSelect}
+          />
         </CardContent>
       </Card>
     </div>
